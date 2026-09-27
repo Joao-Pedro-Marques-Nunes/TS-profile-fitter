@@ -1,0 +1,14 @@
+data/
+results/
+plots/
+exports/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.pkl
+*.pickle
+*.npy
+*.npz
+.ipynb_checkpoints/
+
+configs/pipeline_config_run_*.yaml

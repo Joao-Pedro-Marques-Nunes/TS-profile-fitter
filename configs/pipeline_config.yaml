@@ -1,0 +1,103 @@
+data_dir: ../data
+shot_list: ../configs/shot_list.csv
+database: ../data/34383---38808_database_dt-0.1s.pkl
+output_dir: ../results/EQH
+output_database: ../results/EQH/34383---38808_database_dt-0.1s_fitted.pkl
+output_database_csv: ../results/EQH/34383---38808_database_dt-0.1s_fitted.csv
+cache:
+  directory: ../results/EQH/cache
+  reuse_failed: false
+  provider_id: get_LcSOL_v1
+  mapped_data:
+    enabled: true
+  physics_inputs:
+    enabled: true
+  connection_length:
+    enabled: true
+equilibrium: EQH
+diagnostic: VTA
+fit_config_id: mtanh
+fit_config:
+  preprocess:
+    r_edge_offset: 0.008
+    mapping_method: ipfnpytools
+    rhop_filter:
+      core:
+        rhop: rho_pol
+        rhop_min: 0.2
+        rhop_max: 0.97
+    outlier_config:
+      Te_edge:
+        value_min: 0.0
+        value_max: 1000.0
+        error_max: 180.0
+        rel_error_max: null
+        remove_zeros: true
+      Ne_edge:
+        value_min: 0.0
+        value_max: 1.1e+20
+        error_max: 5.5e+18
+        remove_zeros: true
+      Te_core:
+        value_min: 0.0
+        value_max: 7000.0
+        error_max: null
+        remove_zeros: true
+      Ne_core:
+        value_min: 0.0
+        value_max: 1.3e+20
+        error_max: null
+        remove_zeros: true
+    cold_dense_edge_config:
+      enabled: False
+      te_max: 1.1
+      ne_min: 1.0e+19
+    distance_outlier_config:
+      Ne_edge:
+        enabled: false
+        n_neighbors: 5
+        min_points: 3
+        min_value: 2.0e+19
+        max_relative_error: 0.05
+        zscore: 5.0
+        min_scale: 1.0e+18
+        short_group_max_points: 5
+        te_floor: 1.1
+        te_max_relative_error: 0.05
+  fits:
+    mtanh:
+      Te:
+        deg_tail: 1
+        deg_top: 3
+        fix_a_tail: null
+        y_scale: 1.0e3
+      Ne:
+        deg_tail: 2
+        deg_top: 3
+        y_scale: 1.0e19
+    spline:
+      method: ipfn_spline
+      knot_strategy: edge_biased_quantile
+      knot_count_shift: 0
+      dR_fine: 0.002
+      sigma_conv: 0.0
+      dR_channel_max: 0.003
+      ne_scale: 1.0e+19
+      Te_scale: 1.0e+3
+      max_step_scale: 3
+      use_errors: true
+      s_factor: 1.0
+      mono: decreasing
+      maxiter: 400
+  physics:
+    enabled: true
+    rho_sep: 1.0
+    grid_size: 2000
+    dWdt_method: paper
+  plots:
+    enabled: true
+    kind: summary
+    power_signals: true
+    failure_diagnostics: true
+    summary_directory: ../results/EQH/profile_summary
+    diagnostics_directory: ../results/EQH/profile_diagnostics
