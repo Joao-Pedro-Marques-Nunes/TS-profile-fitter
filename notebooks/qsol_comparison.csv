@@ -1,0 +1,26 @@
+category,quantity,unit,Davide,Repo,Repo - Davide,equation / source
+power balance,P_abs,MW,12.558882,12.5588810525,-9.475000002368006e-07,TTH P_NET
+power balance,P_rsep,MW,5.7865825,5.786582611111111,1.1111111142270147e-07,BPT Pr_sep
+power balance,dW/dt,MW,2.32642909693564,2.4150208072939403,0.08859171035830027,GQH Wmhd fast Field method
+power balance,P_SOL,MW,4.445870403064361,4.357277634094949,-0.08859276896941193,P_abs - P_rsep - dW/dt
+power balance,P_e_SOL,MW,1.8494820876747742,1.812627495783499,-0.03685459189127527,P_SOL * f_e * f_out * f_cond
+outer-midplane geometry,R_omp,m,2.1392329,2.139232873916626,-2.6083374127239267e-08,"Rout [m] / equilibrium rho=1, theta=0"
+outer-midplane geometry,B_p_omp,T,0.4345673339060264,0.4345673339060264,0.0,Bpout [T] = sqrt(Br_out^2 + Bz_out^2)
+outer-midplane geometry,B_t_omp,T,-1.9026971,-1.9026970863342285,1.3665771403381655e-08,Btout [T] / equilibrium rz2brzt
+connection length,L_sol,m,24.63276529759701,24.63276529759701,0.0,Davide Lc [m] / repo L_par
+separatrix,Rsep,m,2.142787165602708,2.142832897181105,4.573157839660169e-05,CSV Rsep / pysepest Rsep
+separatrix,Te_sep,eV,98.88801229575346,98.31701957947355,-0.5709927162799033,CSV Tsep / repo Te_sep
+separatrix,ne_sep,1e19 m^-3,1.7306962973722542,1.7193958945893626,-0.011300402782891572,CSV nsep / repo Ne_sep
+fall-off lengths,lambda_Te,mm,8.310010267405476,8.312573629677399,0.0025633622719229976,Te / -dTe/dR
+fall-off lengths,lambda_q,mm,2.3742886478301357,2.375021037050685,0.000732389220549301,2/7 * lambda_Te
+conduction model,q_P_SOL,MW/m^2,253.741344214598,248.60836995153525,-5.132974263062749,P_e_SOL / A_SOL
+conduction model,q_cond,MW/m^2,253.69858368417545,248.60836833415217,-5.090215350023271,2/7*q_distribution*k0*Te^3.5/L_sol
+conduction model,q_cond - q_P_SOL,MW/m^2,-0.04276053042255512,-1.6173830772459041e-06,0.042758913039477875,separatrix condition
+SOL area,A_SOL,m^2,0.007288847685358368,0.007291096016344341,2.248330985972838e-06,2*pi*R*lambda_q*abs(B_p/B_t)
+SOL area,A_SOL from P/q,m^2,0.007288847993611171,0.007291096016344341,2.2480227331702143e-06,P_e_SOL / q_P_SOL
+model defaults,f_e,,0.8,0.8,0.0,separatrix.py default
+model defaults,f_out,,0.65,0.65,0.0,separatrix.py default
+model defaults,f_cond,,0.8,0.8,0.0,separatrix.py default
+model defaults,Zeff,,2.119304,1.5,-0.6193040000000001,general.csv / repo scalar
+conduction model,k0,W/eV^3.5,1974.6273865033452,2274.555247233609,299.9278607302638,2600/(0.672 + 0.076*sqrt(Zeff) + 0.252*Zeff)
+model defaults,q_distribution,,,1.0,,repo scalar
