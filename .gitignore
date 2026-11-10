@@ -1,5 +1,4 @@
 data/
-results/
 plots/
 exports/
 .pytest_cache/
@@ -10,6 +9,14 @@ __pycache__/
 *.npy
 *.npz
 .ipynb_checkpoints/
+
+# results/ is ignored except the run 06 fitted database (see README).
+# These rules follow *.pkl because the last matching rule wins. Git cannot
+# re-include a file under an ignored directory, so the folders come first.
+results/*
+!results/EQH_run_06_for_thesis/
+results/EQH_run_06_for_thesis/*
+!results/EQH_run_06_for_thesis/34383---38808_database_dt-0.1s_fitted.pkl
 
 configs/pipeline_config_run_*.yaml
 !configs/pipeline_config_run_06_for_thesis.yaml
