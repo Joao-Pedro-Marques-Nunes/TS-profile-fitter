@@ -1,0 +1,99 @@
+# Thesis run configuration (run 06): produces results/EQH_run_06_for_thesis/.
+# Paths are relative to the directory containing this file (configs/).
+data_dir: ../data
+shot_list: shot_list.csv
+database: ../data/34383---38808_database_dt-0.1s.pkl
+output_dir: ../results/EQH_run_06_for_thesis
+output_database: ../results/EQH_run_06_for_thesis/34383---38808_database_dt-0.1s_fitted.pkl
+output_database_csv: ../results/EQH_run_06_for_thesis/34383---38808_database_dt-0.1s_fitted.csv
+cache:
+  directory: ../results/EQH_run_06_for_thesis/cache
+  reuse_failed: false
+  provider_id: get_LcSOL_selectable_v1
+  mapped_data:
+    enabled: true
+  physics_inputs:
+    enabled: true
+  connection_length:
+    enabled: true
+equilibrium: EQH
+diagnostic: VTA
+fit_config_id: mtanh
+fit_config:
+  preprocess:
+    r_edge_offset: 0.008
+    mapping_method: ipfnpytools
+    rhop_filter:
+      core:
+        rhop: rho_pol
+        rhop_min: 0.0
+        rhop_max: 0.97
+    local_statistical_outlier_config:
+      enabled: true
+      upper_value_threshold: 5
+      relative_error_threshold: 15
+      radial_half_width_m:
+        core: 0.03
+        edge: 0.01
+      time_half_width_s: 0.025
+      fallback_to_nearest_channel: true
+      min_neighbors: 6
+      min_radial_neighbors: 3
+      min_temporal_neighbors: 2
+    cold_dense_edge_config:
+      enabled: false
+      te_max: 1.1
+      ne_min: 1.0e+19
+    density_outside_separatrix_config:
+      enabled: false
+      median_factor: 1
+      rho_pol_min: 1
+    distance_outlier_config:
+      Ne_edge:
+        enabled: false
+        n_neighbors: 5
+        min_points: 3
+        min_value: 2.0e+19
+        max_relative_error: 0.05
+        zscore: 5.0
+        min_scale: 1.0e+18
+        short_group_max_points: 5
+        te_floor: 1.1
+        te_max_relative_error: 0.05
+  fits:
+    mtanh:
+      Te:
+        deg_tail: 1
+        deg_top: 3
+        fix_a_tail: 0
+        y_scale: 1.0e3
+      Ne:
+        deg_tail: 1
+        deg_top: 3
+        y_scale: 1.0e19
+    spline:
+      method: ipfn_spline
+      knot_strategy: hybrid
+      knot_count_shift: +2
+      dR_fine: 0.002
+      sigma_conv: 0.0
+      dR_channel_max: 0.003
+      ne_scale: 1.0e+19
+      Te_scale: 1000.0
+      max_step_scale: 3
+      use_errors: true
+      s_factor: 1.0
+      mono: decreasing
+      maxiter: 500
+  physics:
+    enabled: true
+    rho_sep: 1.0
+    grid_size: 4000
+    dWdt_method: fix_to_0
+  plots:
+    enabled: true
+    kind: summary
+    power_signals: false
+    failure_diagnostics: true
+    summary_directory: ../results/EQH_run_06_for_thesis/profile_summary
+    diagnostics_directory: ../results/EQH_run_06_for_thesis/profile_diagnostics
