@@ -12,3 +12,8 @@ __pycache__/
 .ipynb_checkpoints/
 
 configs/pipeline_config_run_*.yaml
+!configs/pipeline_config_run_06_for_thesis.yaml
+
+# core dumps (core.<exe>.<pid>) and editor backups
+core.*.[0-9]*
+*.backup
