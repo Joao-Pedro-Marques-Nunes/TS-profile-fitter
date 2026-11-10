@@ -25,6 +25,7 @@ from .fitting import (
     modified_tanh,
 )
 from .fit_metrics import compute_fit_metrics
+from .separatrix import PowerBalanceUnavailableError
 from .loading import (
     EquilibriumUnavailableError,
     load_physics_context,
@@ -41,8 +42,10 @@ from .plotting import (
 )
 from .preprocess import (
     apply_cold_dense_edge_filters,
+    apply_density_outside_separatrix_filter,
     apply_distance_outlier_filters,
     apply_preprocessing_filters,
+    apply_shot_wide_statistical_outlier_filter,
     map_to_r_midplane,
     preprocess_ts_data,
 )
@@ -117,7 +120,7 @@ def _write_cache_reference_row(output_dir, kind, key_data, value):
             'dWdt source': metadata.get('sources', {}).get('dWdt'),
             'geometry source': metadata.get('sources', {}).get('geometry'),
         }
-        filename = 'db_Lgil2024_physics input.csv'
+        filename = 'db_Lgil2024_physics_input.csv'
     elif kind == 'connection_length':
         row = {
             'shot': key_data['shot_id'],
@@ -197,20 +200,15 @@ def _physics_result(R, Te, Ne, physics_inputs, model_config, grid_size, fit_meth
     )
 
 
-def _fit_quality_metrics(
-    x_te,
-    y_te,
-    yerr_te,
-    x_ne,
-    y_ne,
-    yerr_ne,
-    ds_out,
-    mtanh_results,
-    mtanh_config,
-    spline_parameters,
-):
-    """Compute fit metrics against the original measured TS points."""
-    metrics = {'mtanh': {}, 'spline': {}}
+def _complete_stage(diagnostic_context, stage):
+    """Record that a pipeline stage finished without error."""
+    diagnostic_context.setdefault('completed_stages', []).append(stage)
+
+
+def _mtanh_fit_metrics(x_te, y_te, yerr_te, x_ne, y_ne, yerr_ne,
+                       mtanh_results, mtanh_config):
+    """Compute mTanh fit metrics against the original measured TS points."""
+    metrics = {}
     for quantity, x, y, yerr in (
         ('Te', x_te, y_te, yerr_te),
         ('Ne', x_ne, y_ne, yerr_ne),
@@ -226,10 +224,16 @@ def _fit_quality_metrics(
         mtanh_fit = modified_tanh(
             x, *np.asarray(mtanh_results[quantity][0], dtype=float)
         )
-        metrics['mtanh'][quantity] = compute_fit_metrics(
+        metrics[quantity] = compute_fit_metrics(
             y, mtanh_fit, yerr, n_parameters=n_parameters
         )
+    return metrics
 
+
+def _spline_fit_metrics(x_te, y_te, yerr_te, x_ne, y_ne, yerr_ne,
+                        ds_out, spline_parameters):
+    """Compute spline fit metrics against the original measured TS points."""
+    metrics = {}
     spline_x = ds_out['R_mid_spl'].to_numpy(float)
     for quantity, observed, column, parameter_count in (
         ('Te', (x_te, y_te, yerr_te), 'Te_spl', len(spline_parameters['Te'])),
@@ -237,10 +241,36 @@ def _fit_quality_metrics(
     ):
         x, y, yerr = observed
         spline_fit = np.interp(x, spline_x, ds_out[column].to_numpy(float))
-        metrics['spline'][quantity] = compute_fit_metrics(
+        metrics[quantity] = compute_fit_metrics(
             y, spline_fit, yerr, n_parameters=parameter_count
         )
     return metrics
+
+
+def _profile_at(R, values, R_at):
+    """Interpolate a profile at R_at, or return NaN outside the profile range."""
+    if not (np.min(R) <= R_at <= np.max(R)):
+        return np.nan
+    value = float(np.interp(R_at, R, values))
+    return value if np.isfinite(value) else np.nan
+
+
+def _pedestal_profile_values(R, Te, Ne, R_ped):
+    """Evaluate one fitted Ne/Te profile and its decay lengths at R_ped; p_ped is in kPa."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        lambda_Te = -Te / np.gradient(Te, R)
+        lambda_Ne = -Ne / np.gradient(Ne, R)
+        lambda_p = 1.0 / (1.0 / lambda_Te + 1.0 / lambda_Ne)
+    Te_ped = _profile_at(R, Te, R_ped)
+    Ne_ped = _profile_at(R, Ne, R_ped)
+    return {
+        'Te_ped': Te_ped,
+        'Ne_ped': Ne_ped,
+        'p_ped': Ne_ped * Te_ped * 1.602176634e-22,
+        'lambda_Te_ped': _profile_at(R, lambda_Te, R_ped),
+        'lambda_Ne_ped': _profile_at(R, lambda_Ne, R_ped),
+        'lambda_p_ped': _profile_at(R, lambda_p, R_ped),
+    }
 
 
 def run_interval(
@@ -255,6 +285,7 @@ def run_interval(
     diagnostic_context=None,
     mapped_shot_data=None,
     physics_context=None,
+    shot_wide_statistical_outlier_metadata=None,
 ):
     """Run preprocessing and all profile fits for one shot interval."""
     diagnostic_context = diagnostic_context if diagnostic_context is not None else {}
@@ -268,12 +299,29 @@ def run_interval(
             r_edge_offset=preprocess_config.get('r_shift', preprocess_config.get('r_edge_offset', 0.008)),
             mapping_method=preprocess_config.get('mapping_method', 'ipfnpytools'),
             outlier_config=preprocess_config.get('outlier_config'),
+            local_statistical_outlier_config=preprocess_config.get(
+                'local_statistical_outlier_config'),
             rhop_filter=preprocess_config.get('rhop_filter'),
             channel_trim=preprocess_config.get('channel_trim'),
             report_outliers=preprocess_config.get('report_outliers', False),
             return_metadata=True,
         )
     else:
+        local_statistical_config = preprocess_config.get(
+            'local_statistical_outlier_config')
+        if (shot_wide_statistical_outlier_metadata is None
+                and local_statistical_config
+                and local_statistical_config.get('enabled', True)):
+            mapped_shot_data, shot_wide_statistical_outlier_metadata = (
+                apply_shot_wide_statistical_outlier_filter(
+                    mapped_shot_data,
+                    config=local_statistical_config,
+                    rhop_filter=preprocess_config.get('rhop_filter'),
+                    channel_trim=preprocess_config.get('channel_trim'),
+                    report=preprocess_config.get('report_outliers', False),
+                    return_metadata=True,
+                )
+            )
         begin, end = interval['t_begin'], interval['t_end']
         selected = mapped_shot_data[
             mapped_shot_data['time'].between(begin, end)
@@ -281,10 +329,74 @@ def run_interval(
         mapped, preprocess_metadata = apply_preprocessing_filters(
             selected,
             outlier_config=preprocess_config.get('outlier_config'),
+            local_statistical_outlier_config=(
+                None if shot_wide_statistical_outlier_metadata is not None
+                else local_statistical_config
+            ),
             rhop_filter=preprocess_config.get('rhop_filter'),
             channel_trim=preprocess_config.get('channel_trim'),
             report_outliers=preprocess_config.get('report_outliers', False),
         )
+        if shot_wide_statistical_outlier_metadata is not None:
+            statistical_metadata = dict(
+                shot_wide_statistical_outlier_metadata)
+            removed_rows = statistical_metadata['removed_rows']
+            removed_rows = removed_rows.loc[
+                removed_rows['time'].between(begin, end)].copy()
+            if 'statistical_removed_rows' in statistical_metadata:
+                statistical_removed_rows = statistical_metadata[
+                    'statistical_removed_rows']
+                statistical_metadata['statistical_removed_rows'] = (
+                    statistical_removed_rows.loc[
+                        statistical_removed_rows['time'].between(begin, end)
+                    ].copy()
+                )
+            if 'insufficient_support_rows' in statistical_metadata:
+                insufficient_support_rows = statistical_metadata[
+                    'insufficient_support_rows']
+                statistical_metadata['insufficient_support_rows'] = (
+                    insufficient_support_rows.loc[
+                        insufficient_support_rows['time'].between(begin, end)
+                    ].copy()
+                )
+            interval_before_statistical = pd.concat(
+                [selected, removed_rows], ignore_index=True)
+            preprocess_metadata['channels_before'] = {
+                system: int(interval_before_statistical.loc[
+                    interval_before_statistical['system'].eq(system),
+                    'channel_index',
+                ].nunique())
+                for system in ('core', 'edge')
+            }
+            statistical_metadata['removed_rows'] = removed_rows
+            statistical_metadata['removed_rows_scope'] = 'interval'
+            preprocess_metadata['local_statistical_outlier_metadata'] = (
+                statistical_metadata)
+            if not removed_rows.empty:
+                preprocess_metadata['removed_rows'] = pd.concat(
+                    [preprocess_metadata['removed_rows'], removed_rows],
+                    ignore_index=True,
+                )
+    statistical_outlier_metadata = preprocess_metadata.get(
+        'local_statistical_outlier_metadata')
+    diagnostic_context['preprocess_removed_rows'] = preprocess_metadata[
+        'removed_rows']
+    if statistical_outlier_metadata is not None:
+        diagnostic_context['local_statistical_outlier_metadata'] = (
+            statistical_outlier_metadata)
+    density_outside_separatrix_config = preprocess_config.get(
+        'density_outside_separatrix_config')
+    if density_outside_separatrix_config:
+        mapped, density_outside_separatrix_metadata = (
+            apply_density_outside_separatrix_filter(
+                mapped,
+                config=density_outside_separatrix_config,
+                report=preprocess_config.get('report_outliers', False),
+                return_metadata=True,
+            )
+        )
+        diagnostic_context['density_outside_separatrix_metadata'] = (
+            density_outside_separatrix_metadata)
     cold_dense_config = preprocess_config.get('cold_dense_edge_config')
     if cold_dense_config:
         mapped, cold_dense_metadata = apply_cold_dense_edge_filters(
@@ -308,25 +420,6 @@ def run_interval(
     x_te, y_te, yerr_te = _profile_arrays(mapped, 'Te')
     x_ne, y_ne, yerr_ne = _profile_arrays(mapped, 'Ne')
 
-    diagnostic_context['stage'] = 'mtanh'
-    mtanh_config = fits_config.get('mtanh', {})
-    mtanh_results = {}
-    for quantity, x, y, yerr in (('Te', x_te, y_te, yerr_te), ('Ne', x_ne, y_ne, yerr_ne)):
-        quantity_config = mtanh_config.get(quantity, mtanh_config)
-        mtanh_results[quantity] = fit_modified_tanh_profile(
-            x,
-            y,
-            yerr,
-            p0=quantity_config.get('p0'),
-            deg_tail=quantity_config.get('deg_tail', 3),
-            deg_top=quantity_config.get('deg_top', 3),
-            fix_x0=quantity_config.get('fix_x0'),
-            fix_w=quantity_config.get('fix_w'),
-            fix_a_tail=quantity_config.get('fix_a_tail'),
-            y_scale=quantity_config.get('y_scale', 1.0),
-        )
-    diagnostic_context['mtanh_results'] = mtanh_results
-
     diagnostic_context['stage'] = 'spline'
     spline_config = fits_config.get('spline', {})
     spline_input = mapped.rename(columns={'r_midplane': 'R_mid'}).dropna(
@@ -340,6 +433,8 @@ def run_interval(
             preprocess_metadata['channels_removed'],
             knot_count_shift=spline_config.get('knot_count_shift', 0),
             strategy=spline_config.get('knot_strategy', 'global_quantile'),
+            core_merge_rhop_spacing_factor=spline_config.get(
+                'core_merge_rhop_spacing_factor', 0.5),
         )
     spline_method = spline_config.get('method', 'ondrej_spline')
     if spline_method == 'ondrej_spline':
@@ -379,7 +474,7 @@ def run_interval(
     ds_out, knots, p_ne, pcov_ne, p_te, pcov_te = spline_result
     diagnostic_context['ds_out'] = ds_out
     diagnostic_context['knots'] = knots
-    fit_metrics = _fit_quality_metrics(
+    spline_metrics = _spline_fit_metrics(
         x_te,
         y_te,
         yerr_te,
@@ -387,10 +482,81 @@ def run_interval(
         y_ne,
         yerr_ne,
         ds_out,
-        mtanh_results,
-        mtanh_config,
         {'Te': p_te, 'Ne': p_ne},
     )
+    spline_summary = {
+        'method': spline_method,
+        'knot_strategy': spline_config.get('knot_strategy', 'global_quantile'),
+        'knot_count_shift': spline_config.get('knot_count_shift', 0),
+        'dR_fine': spline_config.get('dR_fine', 5e-4),
+        'R_mid_spl': ds_out['R_mid_spl'].to_numpy(),
+        'knots': knots,
+        't_full': ds_out.attrs.get('t_full'),
+        'ne_params': p_ne,
+        'ne_covariance': pcov_ne,
+        'Te_params': p_te,
+        'Te_covariance': pcov_te,
+    }
+    diagnostic_context['spline_fit'] = {
+        'n_points': int(len(spline_input)),
+        'spline': spline_summary,
+        'fit_metrics': spline_metrics,
+    }
+    _complete_stage(diagnostic_context, 'spline')
+
+    diagnostic_context['stage'] = 'mtanh'
+    mtanh_config = fits_config.get('mtanh', {})
+    mtanh_results = {}
+    for quantity, x, y, yerr in (('Te', x_te, y_te, yerr_te), ('Ne', x_ne, y_ne, yerr_ne)):
+        quantity_config = mtanh_config.get(quantity, mtanh_config)
+        mtanh_results[quantity] = fit_modified_tanh_profile(
+            x,
+            y,
+            yerr,
+            p0=quantity_config.get('p0'),
+            deg_tail=quantity_config.get('deg_tail', 3),
+            deg_top=quantity_config.get('deg_top', 3),
+            fix_x0=quantity_config.get('fix_x0'),
+            fix_w=quantity_config.get('fix_w'),
+            fix_a_tail=quantity_config.get('fix_a_tail'),
+            y_scale=quantity_config.get('y_scale', 1.0),
+        )
+    diagnostic_context['mtanh_results'] = mtanh_results
+    mtanh_metrics = _mtanh_fit_metrics(
+        x_te,
+        y_te,
+        yerr_te,
+        x_ne,
+        y_ne,
+        yerr_ne,
+        mtanh_results,
+        mtanh_config,
+    )
+    diagnostic_context['mtanh_metrics'] = mtanh_metrics
+    _complete_stage(diagnostic_context, 'mtanh')
+
+    diagnostic_context['stage'] = 'pedestal'
+    fit_metrics = {'mtanh': mtanh_metrics, 'spline': spline_metrics}
+    rho_ped = (fit_config or {}).get('pedestal', {}).get('rho_pol', 0.95)
+    R_ped = compute_equilibrium_separatrix(
+        ts_data['equ'], interval, rho_sep=rho_ped)['Rsep_eqh']
+    x_mtanh = np.linspace(min(x_te.min(), x_ne.min()), max(x_te.max(), x_ne.max()), 500)
+    pedestal = {
+        'R_ped': R_ped,
+        'spline': _pedestal_profile_values(
+            ds_out['R_mid_spl'].to_numpy(float),
+            ds_out['Te_spl'].to_numpy(float),
+            ds_out['ne_spl'].to_numpy(float),
+            R_ped,
+        ),
+        'mtanh': _pedestal_profile_values(
+            x_mtanh,
+            modified_tanh(x_mtanh, *mtanh_results['Te'][0]),
+            modified_tanh(x_mtanh, *mtanh_results['Ne'][0]),
+            R_ped,
+        ),
+    }
+    _complete_stage(diagnostic_context, 'pedestal')
     result = {
         'shot_id': int(shot_id),
         **_run_metadata(fit_config),
@@ -401,20 +567,12 @@ def run_interval(
             'Te': {'params': mtanh_results['Te'][0], 'covariance': mtanh_results['Te'][1]},
             'Ne': {'params': mtanh_results['Ne'][0], 'covariance': mtanh_results['Ne'][1]},
         },
-        'spline': {
-            'method': spline_method,
-            'knot_strategy': spline_config.get('knot_strategy', 'global_quantile'),
-            'R_mid_spl': ds_out['R_mid_spl'].to_numpy(),
-            'knots': knots,
-            'ne_params': p_ne,
-            'ne_covariance': pcov_ne,
-            'Te_params': p_te,
-            'Te_covariance': pcov_te,
-        },
+        'spline': spline_summary,
         'physics': None,
         '_mapped': mapped,
         '_ds_out': ds_out,
         '_knots': knots,
+        '_pedestal': pedestal,
     }
 
     physics_config = (fit_config or {}).get('physics', {})
@@ -427,7 +585,7 @@ def run_interval(
                 shot_id,
                 interval,
                 equilibrium=equilibrium,
-                dWdt_method=physics_config.get('dWdt_method', 'paper'),
+                dWdt_method=physics_config.get('dWdt_method', 'fix_to_0'),
                 elm_fraction=physics_config.get('elm_fraction', (0.75, 0.95)),
                 physics_context=context,
             )
@@ -437,10 +595,14 @@ def run_interval(
         else:
             physics_inputs, physics_cache_hit = physics_cache.physics_inputs(
                 shot_id, interval, equilibrium, load_inputs)
-        dR = physics_config.get('connection_length', {}).get('dR', 1e-3)
+        connection_length_config = physics_config.get('connection_length', {})
+        dR = connection_length_config.get('dR', 1e-3)
+        provider_kwargs = (
+            {'plot': 1} if connection_length_config.get('plot', False) else {}
+        )
         get_length = lambda: get_connection_length(
             shot_id, interval, provider=connection_length_provider, dR=dR,
-            equilibrium=equilibrium)
+            equilibrium=equilibrium, **provider_kwargs)
         if physics_cache is None:
             physics_inputs['geometry']['L_par'] = get_length()
             connection_cache_hit = False
@@ -469,7 +631,6 @@ def run_interval(
                 'spline',
             ),
         }
-        x_mtanh = np.linspace(min(x_te.min(), x_ne.min()), max(x_te.max(), x_ne.max()), 500)
         result['physics']['mtanh'] = _physics_result(
             x_mtanh,
             modified_tanh(x_mtanh, *mtanh_results['Te'][0]),
@@ -479,6 +640,7 @@ def run_interval(
             physics_config.get('grid_size', 2000),
             'mtanh',
         )
+        _complete_stage(diagnostic_context, 'physics')
 
     if make_plots:
         diagnostic_context['stage'] = 'plots'
@@ -665,6 +827,53 @@ def _public_result(result):
     return {key: value for key, value in result.items() if not key.startswith('_')}
 
 
+def _scalars_only(mapping):
+    scalars = {}
+    for key, value in mapping.items():
+        if isinstance(value, dict):
+            scalars[key] = _scalars_only(value)
+        elif value is None or isinstance(value, (bool, int, float, str, np.number, np.bool_)):
+            scalars[key] = value
+    return scalars
+
+
+def _param_errors(covariance):
+    if covariance is None:
+        return None
+    return np.sqrt(np.diag(np.asarray(covariance, dtype=float))).tolist()
+
+
+def _interval_json(result):
+    """Readable per-interval payload: fit parameters and scalar physics only."""
+    payload = _public_result(result)
+    payload['mtanh'] = {
+        quantity: {
+            'params': fit['params'],
+            'param_errors': _param_errors(fit['covariance']),
+        }
+        for quantity, fit in result['mtanh'].items()
+    }
+    spline = result['spline']
+    payload['spline'] = {
+        'method': spline['method'],
+        'knot_strategy': spline['knot_strategy'],
+        'knot_count_shift': spline['knot_count_shift'],
+        'dR_fine': spline['dR_fine'],
+        'knots': spline['knots'],
+        't_full': spline['t_full'],
+        'ne_params': spline['ne_params'],
+        'ne_param_errors': _param_errors(spline['ne_covariance']),
+        'Te_params': spline['Te_params'],
+        'Te_param_errors': _param_errors(spline['Te_covariance']),
+    }
+    physics = result.get('physics')
+    payload['physics'] = None if physics is None else {
+        name: _scalars_only(values) if isinstance(values, dict) else values
+        for name, values in physics.items()
+    }
+    return payload
+
+
 def _result_warning(result):
     mtanh_physics = (result.get('physics') or {}).get('mtanh', {})
     if mtanh_physics.get('valid', True) is False:
@@ -681,6 +890,66 @@ def _scalar_at_sep(state, grid_name, value_name):
     if grid.size == 0 or grid.size != values.size:
         return np.nan
     return float(np.interp(state['Rsep'], grid, values))
+
+
+STAGE_STATUS_COLUMNS = ('failed_stage', 'spline_status', 'mtanh_status', 'physics_status')
+_STAGE_GROUPS = {
+    'spline': 'spline',
+    'mtanh': 'mtanh',
+    'pedestal': 'physics',
+    'physics': 'physics',
+    'power_balance': 'physics',
+}
+_GROUP_DONE_STAGE = {'spline': 'spline', 'mtanh': 'mtanh', 'physics': 'physics'}
+
+
+def _failure_stage(diagnostic_context, exc):
+    """Name the failing stage; unavailable power balance is reported as its own stage."""
+    if isinstance(exc, PowerBalanceUnavailableError):
+        return 'power_balance'
+    return diagnostic_context.get('stage', 'unknown')
+
+
+def _stage_status_fields(diagnostic_context, failed_stage=None):
+    """Per fit group: 'failed' for the failing group, 'ok' if completed, else 'not_run'."""
+    completed = set(diagnostic_context.get('completed_stages', []))
+    failed_group = _STAGE_GROUPS.get(failed_stage)
+    fields = {'failed_stage': failed_stage or ''}
+    for group, done_stage in _GROUP_DONE_STAGE.items():
+        if failed_group == group:
+            status = 'failed'
+        elif done_stage in completed:
+            status = 'ok'
+        else:
+            status = 'not_run'
+        fields[f'{group}_status'] = status
+    return fields
+
+
+def _stage_columns(record):
+    """Stage status columns for one run record, with defaults for records without them."""
+    return {
+        'failed_stage': record.get('failed_stage', ''),
+        'spline_status': record.get('spline_status', 'not_run'),
+        'mtanh_status': record.get('mtanh_status', 'not_run'),
+        'physics_status': record.get('physics_status', 'not_run'),
+    }
+
+
+def _partial_result(diagnostic_context):
+    """Result-shaped spline and mTanh outputs completed before a failure, or None."""
+    spline_fit = diagnostic_context.get('spline_fit')
+    if spline_fit is None:
+        return None
+    return {
+        'n_points': spline_fit['n_points'],
+        'spline': spline_fit['spline'],
+        'fit_metrics': {
+            'mtanh': diagnostic_context.get('mtanh_metrics') or {},
+            'spline': spline_fit['fit_metrics'],
+        },
+        'physics': None,
+    }
 
 
 def _result_summary(result, status='ok', error=''):
@@ -704,6 +973,20 @@ def _result_summary(result, status='ok', error=''):
         prefix = f'{method}_'
         for name in ('Rsep', 'Te_sep', 'Ne_sep', 'P_SOL', 'P_e_SOL'):
             summary[prefix + name] = state.get(name, np.nan)
+        try:
+            ne_sep = float(state['Ne_sep'])
+            te_sep = float(state['Te_sep'])
+        except (KeyError, TypeError, ValueError):
+            pressure_sep = np.nan
+        else:
+            pressure_sep = (
+                ne_sep * te_sep * 1.602176634e-22
+                if np.isfinite(ne_sep) and np.isfinite(te_sep)
+                else np.nan
+            )
+        summary[prefix + 'p_sep'] = pressure_sep
+        summary[prefix + 'lambda_p_sep'] = state.get('lambda_p_sep', np.nan)
+        summary[prefix + 'lambda_Ne_sep'] = state.get('lambda_Ne_sep', np.nan)
         summary[prefix + 'lambda_Te_sep'] = _scalar_at_sep(
             state, 'R_grid', 'lam_Te_grid')
         summary[prefix + 'lambda_q_sep'] = _scalar_at_sep(
@@ -714,6 +997,13 @@ def _result_summary(result, status='ok', error=''):
             state, 'R_grid', 'q_par_SH_grid')
     eqh = (physics or {}).get('eqh', {})
     summary['Rsep_eqh'] = eqh.get('Rsep_eqh', np.nan)
+    pedestal = (result or {}).get('_pedestal', {})
+    for method in ('spline', 'mtanh'):
+        state = pedestal.get(method, {})
+        for name in ('Ne_ped', 'p_ped', 'Te_ped',
+                     'lambda_Te_ped', 'lambda_Ne_ped', 'lambda_p_ped'):
+            summary[f'{method}_{name}'] = state.get(name, np.nan)
+    summary['Rped_eqh'] = pedestal.get('R_ped', np.nan)
     return summary
 
 
@@ -729,6 +1019,11 @@ def _write_run_summary(output_dir, records, selected_shots, run_started, run_fin
     failed = sum(record.get('status') == 'failed' for record in records)
     skipped = sum(record.get('status') == 'skipped' for record in records)
     total_intervals = successful + failed
+    failed_by_stage = {}
+    for record in records:
+        if record.get('status') == 'failed':
+            stage = record.get('failed_stage') or 'unknown'
+            failed_by_stage[stage] = failed_by_stage.get(stage, 0) + 1
     shot_summaries = []
     for shot_id in selected_shots:
         shot_records = [record for record in records if int(record['shot_id']) == int(shot_id)]
@@ -766,6 +1061,7 @@ def _write_run_summary(output_dir, records, selected_shots, run_started, run_fin
             'successful': successful,
             'warnings': warnings,
             'failed': failed,
+            'failed_by_stage': failed_by_stage,
             'skipped': skipped,
             'success_rate': successful / total_intervals if total_intervals else None,
         },
@@ -784,16 +1080,22 @@ def _write_run_summary(output_dir, records, selected_shots, run_started, run_fin
 
 
 def enrich_database(intervals_df, records):
-    """Merge scalar interval results into a canonical interval database."""
+    """Merge scalar results and restore the analysis database's interval keys."""
     enriched = intervals_df.copy()
     key_columns = ['shot_id', 't_begin', 't_end']
     summaries = pd.DataFrame(records)
     if summaries.empty:
-        for column in ('fit_status', 'fit_error'):
+        for column in ('fit_status', 'fit_error', *STAGE_STATUS_COLUMNS):
             enriched[column] = pd.Series(dtype=object)
-        return enriched
-    summaries = summaries.drop_duplicates(key_columns, keep='last')
-    return enriched.merge(summaries, on=key_columns, how='left', suffixes=('', '_result'))
+    else:
+        summaries = summaries.drop_duplicates(key_columns, keep='last')
+        enriched = enriched.merge(
+            summaries, on=key_columns, how='left', suffixes=('', '_result'))
+    return enriched.rename(columns={
+        'shot_id': 'shot',
+        't_begin': 't_begin (s)',
+        't_end': 't_end (s)',
+    })
 
 
 def run_shot(shot_id, data_dir, intervals_df, output_dir, fit_config=None,
@@ -860,6 +1162,17 @@ def run_shot(shot_id, data_dir, intervals_df, output_dir, fit_config=None,
         f'| {time.perf_counter() - mapping_started:.1f} s',
         flush=True,
     )
+    mapped_shot_data, shot_wide_statistical_outlier_metadata = (
+        apply_shot_wide_statistical_outlier_filter(
+            mapped_shot_data,
+            config=preprocess_config.get(
+                'local_statistical_outlier_config'),
+            rhop_filter=preprocess_config.get('rhop_filter'),
+            channel_trim=preprocess_config.get('channel_trim'),
+            report=preprocess_config.get('report_outliers', False),
+            return_metadata=True,
+        )
+    )
     shot_output = os.path.join(output_dir, f'shot_{int(shot_id)}')
     os.makedirs(shot_output, exist_ok=True)
     records = []
@@ -883,10 +1196,12 @@ def run_shot(shot_id, data_dir, intervals_df, output_dir, fit_config=None,
                 diagnostic_context=diagnostic_context,
                 mapped_shot_data=mapped_shot_data,
                 physics_context=physics_context,
+                shot_wide_statistical_outlier_metadata=(
+                    shot_wide_statistical_outlier_metadata),
             )
             result_path = os.path.join(shot_output, f"interval_{interval['t_begin']:.3f}_{interval['t_end']:.3f}.json")
             with open(result_path, 'w', encoding='utf-8') as stream:
-                json.dump(_as_jsonable(_public_result(result)), stream, indent=2)
+                json.dump(_as_jsonable(_interval_json(result)), stream, indent=2)
             warning = _result_warning(result)
             status = 'warning' if warning else 'ok'
             records.append({
@@ -896,6 +1211,7 @@ def run_shot(shot_id, data_dir, intervals_df, output_dir, fit_config=None,
                 'status': status,
                 'warning': warning,
                 'result': result_path,
+                **_stage_status_fields(diagnostic_context),
                 '_interval_runtime_seconds': time.perf_counter() - interval_started,
                 '_result_data': result,
             })
@@ -905,6 +1221,7 @@ def run_shot(shot_id, data_dir, intervals_df, output_dir, fit_config=None,
                 f'  done | {status} | {time.perf_counter() - interval_started:.1f} s '
                 f'| Rsep_spline={spline_sep:.4f}', flush=True)
         except Exception as exc:
+            failed_stage = _failure_stage(diagnostic_context, exc)
             diagnostic_path = _plot_failure_diagnostic(
                 int(shot_id), interval, ts_data, shot_output, fit_config,
                 diagnostic_context, str(exc),
@@ -915,11 +1232,13 @@ def run_shot(shot_id, data_dir, intervals_df, output_dir, fit_config=None,
                 'warning': '',
                 'error': str(exc), 'traceback': traceback.format_exc(),
                 'diagnostic_plot': diagnostic_path or '',
+                **_stage_status_fields(diagnostic_context, failed_stage),
+                '_partial_result': _partial_result(diagnostic_context),
                 '_interval_runtime_seconds': time.perf_counter() - interval_started,
             })
             print(
-                f'  done | FAILED | {time.perf_counter() - interval_started:.1f} s '
-                f'| {exc}', flush=True)
+                f'  done | FAILED (stage: {failed_stage}) | '
+                f'{time.perf_counter() - interval_started:.1f} s | {exc}', flush=True)
     status_path = os.path.join(shot_output, 'interval_status.csv')
     status_records = [
         {key: value for key, value in record.items() if not key.startswith('_')}
@@ -1027,12 +1346,13 @@ def run_database(shot_list_df, intervals_df, data_dir, output_dir, fit_config=No
             **_interval_dict(record),
             **{key: record.get(key, '') for key in (
                 'equilibrium', 'diagnostic', 'fit_config_id')},
+            **_stage_columns(record),
         }
         if record['status'] in ('ok', 'warning'):
             summary.update(_result_summary(record.get('_result_data'), status='ok'))
         else:
             summary.update(_result_summary(
-                None,
+                record.get('_partial_result'),
                 status=record['status'],
                 error=record.get('error', ''),
             ))

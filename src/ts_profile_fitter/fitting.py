@@ -189,8 +189,9 @@ def compute_channel_knots(
     channels_removed=None,
     knot_count_shift=0,
     strategy='global_quantile',
+    core_merge_rhop_spacing_factor=0.5,
 ):
-    """Compute spline knot positions from retained TS channel geometry."""
+    """Compute spline knots, including core-anchored edge strategies."""
     required_columns = {'R_mid'}
     missing = required_columns.difference(ds_ts.columns)
     if missing:
@@ -199,20 +200,139 @@ def compute_channel_knots(
     channels_removed = channels_removed or {'core': 0, 'edge': 0}
     retained_core = channels_before['core'] - channels_removed.get('core', 0)
     retained_edge = channels_before['edge'] - channels_removed.get('edge', 0)
-    base_count = int((retained_core + retained_edge) / 2)
-    n_knots = base_count + int(knot_count_shift)
-    if n_knots < 4:
-        raise ValueError(f"Cubic spline fitting requires at least 4 knots; got {n_knots}.")
-
     if strategy not in {
         'global_quantile',
         'balanced_quantile',
         'edge_biased_quantile',
+        'hybrid',
     }:
         raise ValueError(
             f"Unknown knot strategy {strategy!r}; expected 'global_quantile' "
-            "'balanced_quantile', or 'edge_biased_quantile'."
+            "'balanced_quantile', 'edge_biased_quantile', or 'hybrid'."
         )
+
+    if strategy in {'hybrid', 'edge_biased_quantile'}:
+        core_anchored_columns = {'system', 'channel_index', 'rho_pol'}
+        missing = core_anchored_columns.difference(ds_ts.columns)
+        if missing:
+            raise ValueError(
+                'Core-anchored knot placement requires columns: '
+                f'{sorted(missing)}'
+            )
+
+        try:
+            core_merge_rhop_spacing_factor = float(
+                core_merge_rhop_spacing_factor)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                'core_merge_rhop_spacing_factor must be a finite non-negative number.'
+            ) from error
+        if (not np.isfinite(core_merge_rhop_spacing_factor)
+                or core_merge_rhop_spacing_factor < 0):
+            raise ValueError(
+                'core_merge_rhop_spacing_factor must be a finite non-negative number.'
+            )
+
+        core_anchored_data = ds_ts[
+            ['system', 'channel_index', 'R_mid', 'rho_pol']
+        ].copy()
+        core_anchored_data['R_mid'] = pd.to_numeric(
+            core_anchored_data['R_mid'], errors='coerce')
+        core_anchored_data['rho_pol'] = pd.to_numeric(
+            core_anchored_data['rho_pol'], errors='coerce')
+        core_anchored_data = core_anchored_data.dropna(
+            subset=['system', 'channel_index', 'R_mid', 'rho_pol'])
+        core_anchored_data = core_anchored_data.loc[
+            np.isfinite(core_anchored_data['R_mid'])
+            & np.isfinite(core_anchored_data['rho_pol'])]
+        core_channels = (
+            core_anchored_data.loc[core_anchored_data['system'].eq('core')]
+            .groupby('channel_index', sort=False)
+            .agg(R_mid=('R_mid', 'median'), rho_pol=('rho_pol', 'median'))
+            .sort_values('rho_pol', kind='stable')
+        )
+        edge_data = core_anchored_data.loc[
+            core_anchored_data['system'].eq('edge')
+        ]
+        edge_channel_count = edge_data['channel_index'].nunique()
+        if strategy == 'hybrid':
+            edge_positions = (
+                edge_data.groupby('channel_index', sort=False)['R_mid']
+                .median()
+                .to_numpy(dtype=float)
+            )
+        else:
+            edge_positions = edge_data['R_mid'].to_numpy(dtype=float)
+        if core_channels.empty or edge_channel_count == 0:
+            raise ValueError(
+                'Core-anchored knot placement requires retained core and edge channels.'
+            )
+
+        core_channel_ids = core_channels.index.to_numpy()
+        core_rhop = core_channels['rho_pol'].to_numpy(dtype=float)
+        core_channel_positions = core_channels['R_mid'].to_numpy(dtype=float)
+        core_rhop_gaps = np.diff(core_rhop)
+        positive_rhop_gaps = core_rhop_gaps[core_rhop_gaps > 0]
+        typical_rhop_gap = (
+            float(np.median(positive_rhop_gaps))
+            if positive_rhop_gaps.size else 0.0
+        )
+        merge_threshold = (
+            core_merge_rhop_spacing_factor * typical_rhop_gap)
+        core_groups = [[0]]
+        for position_index, rhop_gap in enumerate(core_rhop_gaps, start=1):
+            if typical_rhop_gap > 0 and rhop_gap < merge_threshold:
+                print(
+                    'Merged core channels '
+                    f'{core_channel_ids[position_index - 1]} and '
+                    f'{core_channel_ids[position_index]} '
+                    f'(rho_pol gap={rhop_gap:.6g}, '
+                    f'threshold={merge_threshold:.6g})'
+                )
+                core_groups[-1].append(position_index)
+            else:
+                core_groups.append([position_index])
+        core_positions = np.asarray([
+            np.median(core_channel_positions[group])
+            for group in core_groups
+        ], dtype=float)
+
+        n_edge_knots = int(np.ceil(edge_channel_count / 2)) + int(knot_count_shift)
+        if n_edge_knots < 1:
+            raise ValueError(
+                'Hybrid knot placement requires at least one edge knot; '
+                f'got {n_edge_knots}.'
+            )
+        if n_edge_knots > np.unique(edge_positions).size:
+            raise ValueError(
+                f"Cannot compute {n_edge_knots} edge knots from "
+                f"{np.unique(edge_positions).size} unique edge-channel positions."
+            )
+
+        n_knots = core_positions.size + n_edge_knots
+        if n_knots < 4:
+            raise ValueError(f"Cubic spline fitting requires at least 4 knots; got {n_knots}.")
+
+        edge_quantiles = (
+            np.array([0.5])
+            if n_edge_knots == 1
+            else np.linspace(0.0, 1.0, n_edge_knots)
+        )
+        knots = np.sort(np.concatenate([
+            core_positions,
+            np.quantile(edge_positions, edge_quantiles),
+        ]))
+        if np.unique(knots).size != n_knots:
+            raise ValueError(
+                'Core and edge knot positions must be distinct; core-channel '
+                'medians and edge quantiles overlap.'
+            )
+        return knots
+
+    base_count = int(np.ceil((retained_core + retained_edge) / 2))
+    n_knots = base_count + int(knot_count_shift)
+    if n_knots < 4:
+        raise ValueError(f"Cubic spline fitting requires at least 4 knots; got {n_knots}.")
 
     if strategy == 'global_quantile':
         radial_positions = ds_ts['R_mid'].to_numpy(dtype=float)
@@ -231,10 +351,7 @@ def compute_channel_knots(
     edge_positions = ds_ts.loc[ds_ts['system'].eq('edge'), 'R_mid'].to_numpy(float)
     core_positions = core_positions[np.isfinite(core_positions)]
     edge_positions = edge_positions[np.isfinite(edge_positions)]
-    if strategy == 'balanced_quantile':
-        n_core = n_knots // 2
-    else:
-        n_core = int(round(0.4 * n_knots))
+    n_core = n_knots // 2
     n_edge = n_knots - n_core
     if np.unique(core_positions).size < n_core:
         raise ValueError(
@@ -485,6 +602,8 @@ def fit_ipfn_spline_ne_Te_TS(
     x = ds['R_mid'].to_numpy(dtype=float)
     if not np.isfinite(x).all():
         raise ValueError('R_mid must contain finite values.')
+    x_min = float(np.min(x))
+    x_max = float(np.max(x))
 
     knots = find_x_means(x, dR_channel_max) if R_knots is None else np.asarray(R_knots, dtype=float)
     if knots.ndim != 1 or knots.size < 4 or not np.isfinite(knots).all():
@@ -493,6 +612,8 @@ def fit_ipfn_spline_ne_Te_TS(
         raise ValueError('R_knots must be strictly increasing.')
     if knots[0] < np.min(x) or knots[-1] > np.max(x):
         raise ValueError('R_knots must lie within the fitting data range.')
+    interior_knots = knots[1:-1]
+    #interior_knots = knots[(knots > x_min) & (knots < x_max)]
 
     fit_kw = dict(minimize_kw or {})
     options = dict(fit_kw.pop('options', {}))
@@ -511,7 +632,7 @@ def fit_ipfn_spline_ne_Te_TS(
             x=x,
             y=values / scale,
             w=scale / errors,
-            t=knots[1:-1],
+            t=interior_knots,
             mono=mono,
             bc_type=bc_type,
             sort_and_merge_duplicates=True,
@@ -523,9 +644,9 @@ def fit_ipfn_spline_ne_Te_TS(
     ne_fit = fit_quantity('ne', 'ne_err', ne_scale)
     te_fit = fit_quantity('Te', 'Te_err', Te_scale)
 
-    x_f = np.arange(knots[0], knots[-1], dR_fine)
-    if x_f.size == 0 or x_f[-1] < knots[-1]:
-        x_f = np.append(x_f, knots[-1])
+    x_f = np.arange(x_min, x_max, dR_fine)
+    if x_f.size == 0 or x_f[-1] < x_max:
+        x_f = np.append(x_f, x_max)
     ds_out = pd.DataFrame({'R_mid_spl': x_f})
     for quantity, spline, scale in [
         ('ne', ne_fit, ne_scale),
@@ -538,6 +659,18 @@ def fit_ipfn_spline_ne_Te_TS(
         ds_out[f'{quantity}_spl'] = values
         ds_out[f'd{quantity}_spl'] = derivatives
         ds_out[f'lam_{quantity}_spl'] = lambda_values
+
+    # Full clamped knot vector: the interior knots plus the data min/max repeated k+1 times.
+    t_full = np.r_[np.repeat(x_min, 4), interior_knots, np.repeat(x_max, 4)]
+    ds_out.attrs['t_full'] = t_full
+    for quantity, spline, scale in [
+        ('ne', ne_fit, ne_scale),
+        ('Te', te_fit, Te_scale),
+    ]:
+        rebuilt = interpolate.BSpline(
+            t_full, spline.get_coeffs(), 3, extrapolate=False)(x_f) * scale
+        if not np.allclose(rebuilt, ds_out[f'{quantity}_spl'], rtol=1e-9, atol=1e-9 * scale):
+            raise RuntimeError(f'{quantity} spline cannot be rebuilt from t_full and coefficients.')
 
     return (
         ds_out,

@@ -4,7 +4,6 @@ import sys
 import numpy as np
 import pandas as pd
 import aug_sfutils as sf
-from aug_sfutils import mapeq
 from scipy.ndimage import gaussian_filter1d
 from scipy.interpolate import interp1d
 from scipy.signal import butter, sosfiltfilt
@@ -516,14 +515,16 @@ def load_inter_elm_dwdt(
 
 
 def _read_eqh_outer_midplane(equilibrium, time):
+    rho = np.asarray([1.0], dtype=float)
+    theta = np.asarray([0.0], dtype=float)
     try:
         r_midplane, _ = equilibrium.rhoTheta2rz(
-            1.0, 0.0, t_in=time, coord_in='rho_pol')
+            rho, theta, t_in=time, coord_in='rho_pol')
         return float(np.asarray(r_midplane).ravel()[0])
     except Exception:
         try:
             r_midplane, _ = equilibrium.rhoTheta2rz(
-                np.asarray([[1.0]]), 0.0, t_in=[time],
+                rho.reshape(1, 1), theta, t_in=[time],
                 coord_in='rho_pol', n_line=1)
             return float(np.asarray(r_midplane).ravel()[0])
         except Exception:
@@ -533,12 +534,13 @@ def _read_eqh_outer_midplane(equilibrium, time):
 def _read_eqh_outer_midplane_fields(equilibrium, time):
     """Return ``R_out``, ``B_pol``, and ``B_tor`` from the equilibrium field."""
     try:
-        r_out, z_out = mapeq.rhoTheta2rz(
-            equilibrium, 1.0, 0.0, t_in=time)
+        r_out, z_out = equilibrium.rhoTheta2rz(
+            np.asarray([1.0]), np.asarray([0.0]),
+            t_in=time, coord_in='rho_pol')
         r_out = float(np.asarray(r_out).ravel()[0])
         z_out = float(np.asarray(z_out).ravel()[0])
-        br_out, bz_out, btor_out = mapeq.rz2brzt(
-            equilibrium, r_out, z_out, t_in=time)
+        br_out, bz_out, btor_out = equilibrium.rz2brzt(
+            np.asarray([r_out]), np.asarray([z_out]), t_in=time)
         br_out = float(np.asarray(br_out).ravel()[0])
         bz_out = float(np.asarray(bz_out).ravel()[0])
         btor_out = float(np.asarray(btor_out).ravel()[0])
@@ -587,9 +589,9 @@ def load_physics_inputs(
     P_abs = _read_optional_interval_signal(tth, 'P_NET', t_begin, t_end)
     P_rsep = _read_optional_interval_signal(bpt, 'Pr_sep', t_begin, t_end)
     f_elm = _read_optional_interval_signal(elm, 'f_ELM', t_begin, t_end)
-    if dWdt_method not in {'tot', 'inter_elm', 'paper', 'fast_wmhd'}:
+    if dWdt_method not in {'tot', 'inter_elm', 'paper', 'fast_wmhd', 'fix_to_0'}:
         raise ValueError(
-            "dWdt_method must be 'tot', 'inter_elm', 'paper', or 'fast_wmhd'."
+            "dWdt_method must be 'tot', 'inter_elm', 'paper', 'fast_wmhd', or 'fix_to_0'."
         )
     if not np.isfinite(f_elm):
         dWdt = 0.0
@@ -599,6 +601,10 @@ def load_physics_inputs(
         dWdt = _read_optional_interval_signal(tot, 'dWmhd/dt', t_begin, t_end)
         dWdt_err = np.nan
         dWdt_source = 'TOT:dWmhd/dt'
+    elif dWdt_method == 'fix_to_0':
+        dWdt = 0.0
+        dWdt_err = 0.0
+        dWdt_source = 'fix_to_0'
     elif dWdt_method == 'paper':
         dWdt = 0.25 * P_abs if np.isfinite(P_abs) else np.nan
         dWdt_err = 0.065 * P_abs if np.isfinite(P_abs) else np.nan

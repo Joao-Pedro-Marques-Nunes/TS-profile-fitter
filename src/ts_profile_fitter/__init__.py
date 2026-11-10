@@ -30,6 +30,7 @@ from .separatrix import make_profile, estimate_separatrix
 from .pipeline import run_interval, run_shot, run_database
 from .plotting import (
     plot_profile_fit,
+    plot_filtered_profile_with_outliers,
     plot_spline_profile_fit,
     plot_profile_comparison,
     plot_profile_comparison_full,
@@ -67,6 +68,7 @@ __all__ = [
     "run_database",
     "run_interval",
     "plot_profile_fit",
+    "plot_filtered_profile_with_outliers",
     "plot_spline_profile_fit",
     "plot_profile_comparison",
     "plot_profile_comparison_full",

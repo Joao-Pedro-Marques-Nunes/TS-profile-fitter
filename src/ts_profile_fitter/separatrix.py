@@ -8,6 +8,10 @@ import numpy as np
 from scipy.interpolate import interp1d
 
 
+class PowerBalanceUnavailableError(ValueError):
+    """Raised when the power-balance terms needed for P_SOL are not usable."""
+
+
 def _pysepest_components():
     try:
         from pysepest.finder import find_sep
@@ -119,13 +123,13 @@ def estimate_separatrix(
             unavailable_terms.append(name)
     if unavailable_terms:
         terms = ', '.join(unavailable_terms)
-        raise ValueError(
+        raise PowerBalanceUnavailableError(
             'Power-balance term(s) unavailable for this interval: '
             f'{terms}. Expected finite P_abs, P_rsep, and dWdt values.'
         )
     P_sol = numeric_terms['P_abs'] - numeric_terms['P_rsep'] - numeric_terms['dWdt']
     if not np.isfinite(P_sol):
-        raise ValueError(
+        raise PowerBalanceUnavailableError(
             'Power-balance terms produced a non-finite P_SOL after subtraction.'
         )
 
@@ -187,6 +191,19 @@ def estimate_separatrix(
         state['Te_sep'] = float(profiles['Te'](Rsep))
         if 'Ne' in profiles:
             state['Ne_sep'] = float(profiles['Ne'](Rsep))
+            lambda_te = float(profiles['lam_Te'](Rsep))
+            lambda_ne = float(profiles['lam_Ne'](Rsep))
+            state['lambda_Ne_sep'] = lambda_ne
+            if (np.isfinite(lambda_te) and lambda_te != 0
+                    and np.isfinite(lambda_ne) and lambda_ne != 0):
+                inverse_lambda_p = 1.0 / lambda_te + 1.0 / lambda_ne
+                state['lambda_p_sep'] = (
+                    1.0 / inverse_lambda_p
+                    if np.isfinite(inverse_lambda_p) and inverse_lambda_p != 0
+                    else np.nan
+                )
+            else:
+                state['lambda_p_sep'] = np.nan
     else:
         state['Rsep'] = np.nan
 
@@ -216,4 +233,4 @@ def estimate_separatrix(
     return state
 
 
-__all__ = ['make_profile', 'estimate_separatrix']
+__all__ = ['make_profile', 'estimate_separatrix', 'PowerBalanceUnavailableError']

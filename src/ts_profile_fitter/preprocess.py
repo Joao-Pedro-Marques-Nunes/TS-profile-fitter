@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
+from scipy.spatial import cKDTree
 import aug_sfutils as sf
 import sys
 
@@ -202,6 +203,68 @@ def _append_filter_reason(df, index, reason):
             df.at[idx, 'filter_reason'] = reason
 
 
+def _apply_measurement_validity_filters(
+        df, report=False, return_metadata=False):
+    """Remove invalid TS values and uncertainties before statistical filtering."""
+    filtered_df = _initialize_filter_tracking(df)
+    initially_kept = filtered_df['keep'].to_numpy(dtype=bool)
+    removed_mask = np.zeros(len(filtered_df), dtype=bool)
+    filter_counts = {}
+    reason_counts = {}
+
+    for quantity in ('Te', 'Ne'):
+        values = pd.to_numeric(
+            filtered_df[quantity], errors='coerce').to_numpy(dtype=float)
+        errors = pd.to_numeric(
+            filtered_df[f'{quantity}_err'], errors='coerce').to_numpy(dtype=float)
+        reason_masks = {
+            f'{quantity}_nonfinite_value': ~np.isfinite(values),
+            f'{quantity}_zero_value': values == 0,
+            f'{quantity}_negative_value': values < 0,
+            f'{quantity}_nonfinite_error': ~np.isfinite(errors),
+            f'{quantity}_zero_error': errors == 0,
+            f'{quantity}_negative_error': errors < 0,
+        }
+        quantity_invalid = np.zeros(len(filtered_df), dtype=bool)
+        for reason, reason_mask in reason_masks.items():
+            invalid_positions = initially_kept & reason_mask
+            if not invalid_positions.any():
+                continue
+            reason_indices = filtered_df.index[invalid_positions]
+            _append_filter_reason(filtered_df, reason_indices, reason)
+            reason_counts[reason] = int(np.sum(invalid_positions))
+            quantity_invalid |= invalid_positions
+
+        if quantity_invalid.any():
+            invalid_indices = filtered_df.index[quantity_invalid]
+            _append_filter_reason(
+                filtered_df, invalid_indices, f'{quantity}_outlier')
+            filter_counts[f'{quantity}:invalid_measurement'] = int(
+                np.sum(quantity_invalid))
+            removed_mask |= quantity_invalid
+
+    removed_positions = np.flatnonzero(removed_mask & initially_kept)
+    removed_indices = filtered_df.index[removed_positions]
+    filtered_df.loc[removed_indices, 'keep'] = False
+    removed_rows = filtered_df.iloc[removed_positions].copy()
+    filtered_df = filtered_df.loc[filtered_df['keep']].copy()
+    metadata = {
+        'removed_rows': removed_rows,
+        'filter_counts': filter_counts,
+        'reason_counts': reason_counts,
+        'keep_mask': initially_kept & ~removed_mask,
+    }
+
+    if report and reason_counts:
+        print('[Measurement Validity Filtering Report]')
+        for reason, count in reason_counts.items():
+            print(f'  - {reason}: {count} points')
+
+    if return_metadata:
+        return filtered_df, metadata
+    return filtered_df
+
+
 def _apply_rhop_filter(df, rhop_filter=None, report=False, return_metadata=False):
     parsed = _parse_rhop_filter(rhop_filter)
     if parsed is None:
@@ -244,13 +307,14 @@ def _apply_rhop_filter(df, rhop_filter=None, report=False, return_metadata=False
         system_indices = np.flatnonzero(system_mask)
         coord_values = filtered_df.iloc[system_indices][coord].to_numpy()
         valid = (coord_values >= config['rhop_min']) & (coord_values <= config['rhop_max'])
-        removed_idx = system_indices[~valid]
-        if removed_idx.size:
-            removed_counts[system] += int(removed_idx.size)
+        removed_positions = system_indices[~valid]
+        if removed_positions.size:
+            removed_idx = filtered_df.index[removed_positions]
+            removed_counts[system] += int(removed_positions.size)
             channels_removed[system] = int(
-                filtered_df.iloc[removed_idx]['channel_index'].nunique())
+                filtered_df.iloc[removed_positions]['channel_index'].nunique())
             removed_frames.append(filtered_df.loc[removed_idx].copy())
-            keep_mask[removed_idx] = False
+            keep_mask[removed_positions] = False
             filtered_df.loc[removed_idx, 'keep'] = False
             _append_filter_reason(filtered_df, removed_idx, 'rhop_filter')
 
@@ -377,6 +441,20 @@ def _apply_outlier_filters(df, outlier_config=None, report=False, return_metadat
                 keep_mask[filtered_df.index.get_indexer(removed_idx)] = False
                 filtered_df.loc[removed_idx, 'keep'] = False
                 _append_filter_reason(filtered_df, removed_idx, f'{quantity}_outlier')
+                reason_masks = {
+                    f'{quantity}_zero_value': (
+                        values == 0 if config.get('remove_zeros', False)
+                        else np.zeros(values.shape, dtype=bool)),
+                    f'{quantity}_zero_error': (
+                        errors == 0 if config.get('remove_zeros', False)
+                        else np.zeros(errors.shape, dtype=bool)),
+                    f'{quantity}_negative_value': values < 0,
+                    f'{quantity}_negative_error': errors < 0,
+                }
+                for reason, reason_mask in reason_masks.items():
+                    reason_idx = row_idx[(~kept) & reason_mask]
+                    if reason_idx.size:
+                        _append_filter_reason(filtered_df, reason_idx, reason)
                 removed_frames.append(filtered_df.loc[removed_idx].copy())
                 filter_counts[f'{system}:{quantity}'] = int(np.sum(~kept))
             filtered_df.loc[system_mask, value_col] = filtered_value
@@ -436,6 +514,72 @@ def apply_cold_dense_edge_filters(df, cold_dense_config=None,
     metadata = {
         'removed_rows': removed_rows,
         'filter_counts': {'edge:TeNe': int(removed_idx.size)}
+        if removed_idx.size else {},
+        'keep_mask': keep_mask,
+    }
+    if return_metadata:
+        return filtered_df, metadata
+    return filtered_df
+
+
+def apply_density_outside_separatrix_filter(
+        df, config=None, report=False, return_metadata=False):
+    """Remove high-density points beyond the separatrix in normalized radius."""
+    if config is None or not config.get('enabled', True):
+        if return_metadata:
+            return df, {
+                'removed_rows': df.iloc[0:0].copy(),
+                'filter_counts': {},
+                'keep_mask': np.ones(len(df), dtype=bool),
+            }
+        return df
+
+    required = {'Ne', 'rho_pol'}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f'Density-outside-separatrix filtering requires columns: {sorted(missing)}')
+
+    filtered_df = _initialize_filter_tracking(df)
+    density = pd.to_numeric(filtered_df['Ne'], errors='coerce').to_numpy(dtype=float)
+    rho_pol = pd.to_numeric(
+        filtered_df['rho_pol'], errors='coerce').to_numpy(dtype=float)
+    finite_density = np.isfinite(density)
+    density_median = (
+        float(np.median(density[finite_density]))
+        if finite_density.any() else np.nan
+    )
+    median_factor = float(config.get('median_factor', 0.5))
+    rho_pol_min = float(config.get('rho_pol_min', 1.0))
+    density_threshold = median_factor * density_median
+    remove_mask = (
+        filtered_df['keep'].to_numpy(dtype=bool)
+        & finite_density
+        & np.isfinite(rho_pol)
+        & (density > density_threshold)
+        & (rho_pol > rho_pol_min)
+    )
+    removed_idx = filtered_df.index[remove_mask]
+    if removed_idx.size:
+        filtered_df.loc[removed_idx, 'keep'] = False
+        _append_filter_reason(
+            filtered_df, removed_idx, 'high_density_outside_separatrix')
+        if report:
+            print('[Density-Outside-Separatrix Filtering Report]')
+            print(f'-> Concatenated median density: {density_median:g}')
+            print(f'-> Density threshold: {density_threshold:g}')
+            print(f'-> Removed points: {removed_idx.size}')
+
+    keep_mask = np.ones(len(filtered_df), dtype=bool)
+    keep_mask[filtered_df.index.get_indexer(removed_idx)] = False
+    removed_rows = filtered_df.loc[removed_idx].copy()
+    filtered_df = filtered_df.loc[filtered_df['keep']].copy()
+    metadata = {
+        'density_median': density_median,
+        'density_threshold': density_threshold,
+        'rho_pol_min': rho_pol_min,
+        'removed_rows': removed_rows,
+        'filter_counts': {'high_density_outside_separatrix': int(removed_idx.size)}
         if removed_idx.size else {},
         'keep_mask': keep_mask,
     }
@@ -555,7 +699,6 @@ def apply_distance_outlier_filters(df, distance_outlier_config=None,
                 keep_mask[filtered_df.index.get_indexer(removed_idx)] = False
                 removed_frames.append(filtered_df.loc[removed_idx].copy())
                 filter_counts[f'{system}:{quantity}'] = int(removed_idx.size)
-
                 if report:
                     print(
                         f'[Distance Outlier Filtering Report: {system}:{quantity}]'
@@ -575,6 +718,384 @@ def apply_distance_outlier_filters(df, distance_outlier_config=None,
     if return_metadata:
         return filtered_df, metadata
     return filtered_df
+
+
+def _upper_mad_threshold(values, threshold):
+    median = np.median(values)
+    mad = np.median(np.abs(values - median))
+    return median + threshold * 1.4826 * mad
+
+
+def apply_local_statistical_outlier_filters(
+        df, config=None, report=False, return_metadata=False):
+    """Filter high values and relative errors using local 2-D robust statistics.
+
+    Radial half-widths are in metres and the time half-width is in seconds.
+    A point is evaluated against other measurements from the same system (and
+    shot, when present) inside the configured radial-time window. Insufficient
+    radial or temporal support leaves that point unclassified. The target
+    channel counts toward radial support; nearest rho_pol channels are added
+    only when needed to meet the configured radial support.
+    """
+    if not config or not config.get('enabled', True):
+        if return_metadata:
+            return df, {
+                'removed_rows': df.iloc[0:0].copy(),
+                'filter_counts': {},
+                'criteria_counts': {},
+                'insufficient_support_counts': {},
+                'fallback_neighbor_counts': {},
+                'keep_mask': np.ones(len(df), dtype=bool),
+            }
+        return df
+
+    required = {
+        'system', 'time', 'r_midplane',
+        'Te', 'Te_err', 'Ne', 'Ne_err',
+    }
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f'Local statistical outlier filtering requires columns: {sorted(missing)}')
+
+    radial_widths = config.get('radial_half_width_m')
+    if not isinstance(radial_widths, dict):
+        raise ValueError(
+            "local statistical outlier config must define 'radial_half_width_m' "
+            "for core and edge.")
+
+    default_threshold = float(config.get('threshold', 3.5))
+    upper_value_threshold = float(config.get(
+        'upper_value_threshold', default_threshold))
+    relative_error_threshold = float(config.get(
+        'relative_error_threshold', default_threshold))
+    time_half_width = float(config.get('time_half_width_s', 0.05))
+    min_neighbors = int(config.get('min_neighbors', 6))
+    min_radial_neighbors = int(config.get('min_radial_neighbors', 2))
+    min_temporal_neighbors = int(config.get('min_temporal_neighbors', 2))
+    fallback_to_nearest_channel = bool(
+        config.get('fallback_to_nearest_channel', True))
+    for threshold_name, threshold_value in (
+            ('upper_value_threshold', upper_value_threshold),
+            ('relative_error_threshold', relative_error_threshold)):
+        if not np.isfinite(threshold_value) or threshold_value <= 0:
+            raise ValueError(
+                f'{threshold_name} must be finite and positive.')
+    if not np.isfinite(time_half_width) or time_half_width <= 0:
+        raise ValueError('time_half_width_s must be finite and positive.')
+    if min_neighbors < 1 or min_radial_neighbors < 1 or min_temporal_neighbors < 1:
+        raise ValueError('Local statistical minimum neighbor counts must be positive.')
+
+    radial_half_widths = {}
+    for system in ('core', 'edge'):
+        if system not in radial_widths:
+            raise ValueError(
+                f"radial_half_width_m must define a width for '{system}'.")
+        width = float(radial_widths[system])
+        if not np.isfinite(width) or width <= 0:
+            raise ValueError(
+                f"radial_half_width_m['{system}'] must be finite and positive.")
+        radial_half_widths[system] = width
+
+    filtered_df = _initialize_filter_tracking(df)
+    initially_kept = filtered_df['keep'].to_numpy(dtype=bool)
+    times = pd.to_numeric(filtered_df['time'], errors='coerce').to_numpy(dtype=float)
+    radii = pd.to_numeric(
+        filtered_df['r_midplane'], errors='coerce').to_numpy(dtype=float)
+    channel_ids = (
+        filtered_df['channel_index'].to_numpy()
+        if 'channel_index' in filtered_df.columns else None
+    )
+    radial_positions = pd.to_numeric(
+        filtered_df['rho_pol'] if 'rho_pol' in filtered_df.columns
+        else filtered_df['r_midplane'],
+        errors='coerce',
+    ).to_numpy(dtype=float)
+    values_by_quantity = {
+        quantity: pd.to_numeric(
+            filtered_df[quantity], errors='coerce').to_numpy(dtype=float)
+        for quantity in ('Te', 'Ne')
+    }
+    errors_by_quantity = {
+        quantity: pd.to_numeric(
+            filtered_df[f'{quantity}_err'], errors='coerce').to_numpy(dtype=float)
+        for quantity in ('Te', 'Ne')
+    }
+
+    grouping_columns = ['system']
+    if 'shot' in filtered_df.columns:
+        grouping_columns.append('shot')
+    groups = filtered_df.groupby(
+        grouping_columns, sort=False, dropna=False).indices
+
+    removed_mask = np.zeros(len(filtered_df), dtype=bool)
+    reasons_by_position = {}
+    removed_positions_by_group = {}
+    criteria_counts = {}
+    insufficient_support_counts = {}
+    insufficient_support_rows = []
+    fallback_neighbor_counts = {}
+
+    for group_key, positions in groups.items():
+        system = group_key[0] if isinstance(group_key, tuple) else group_key
+        if system not in radial_half_widths:
+            continue
+
+        positions = np.asarray(positions, dtype=int)
+        positions = positions[initially_kept[positions]]
+        coordinate_valid = (
+            np.isfinite(times[positions]) & np.isfinite(radii[positions]))
+        coordinate_positions = positions[coordinate_valid]
+        if coordinate_positions.size == 0:
+            continue
+
+        radial_half_width = radial_half_widths[system]
+        scaled_coordinates = np.column_stack((
+            radii[coordinate_positions] / radial_half_width,
+            times[coordinate_positions] / time_half_width,
+        ))
+        tree = cKDTree(scaled_coordinates)
+        neighborhoods = tree.query_ball_point(
+            scaled_coordinates, r=1.0, p=np.inf)
+        time_tree = cKDTree(times[coordinate_positions, None])
+        time_neighborhoods = time_tree.query_ball_point(
+            times[coordinate_positions, None], r=time_half_width)
+        fallback_point_positions = set()
+
+        for quantity in ('Te', 'Ne'):
+            key = f'{system}:{quantity}'
+            quantity_values = values_by_quantity[quantity]
+            quantity_errors = errors_by_quantity[quantity]
+            with np.errstate(divide='ignore', invalid='ignore'):
+                relative_errors = quantity_errors / np.abs(quantity_values)
+            relative_errors[
+                ~np.isfinite(quantity_values)
+                | ~np.isfinite(quantity_errors)
+                | (quantity_errors < 0)
+            ] = np.nan
+
+            criteria = criteria_counts.setdefault(key, {
+                'upper_value': 0,
+                'relative_error': 0,
+                'both': 0,
+            })
+            insufficient = insufficient_support_counts.setdefault(key, {
+                'upper_value': 0,
+                'relative_error': 0,
+            })
+            removed_for_group = removed_positions_by_group.setdefault(key, set())
+
+            for local_position, local_neighbors in enumerate(neighborhoods):
+                point_position = coordinate_positions[local_position]
+                if not np.isfinite(quantity_values[point_position]):
+                    continue
+
+                neighbor_positions = coordinate_positions[
+                    np.asarray(local_neighbors, dtype=int)]
+                neighbor_positions = neighbor_positions[
+                    neighbor_positions != point_position]
+
+                if (fallback_to_nearest_channel
+                        and channel_ids is not None
+                    and pd.notna(channel_ids[point_position])
+                    and np.isfinite(radial_positions[point_position])):
+                    existing_channels = channel_ids[neighbor_positions]
+                    existing_channels = existing_channels[
+                        pd.notna(existing_channels)]
+                    spatial_channels = set(existing_channels.tolist())
+                    spatial_channels.add(channel_ids[point_position])
+                    required_channels = min_radial_neighbors + 1
+                    channels_to_add = max(
+                        0, required_channels - len(spatial_channels))
+                    if channels_to_add:
+                        temporal_positions = coordinate_positions[
+                            np.asarray(
+                                time_neighborhoods[local_position], dtype=int)]
+                        temporal_channels = channel_ids[temporal_positions]
+                        radial_valid = np.isfinite(
+                            radial_positions[temporal_positions])
+                        fallback_candidates = temporal_positions[
+                            radial_valid
+                            & pd.notna(temporal_channels)
+                            & ~np.isin(
+                                temporal_channels, list(spatial_channels))
+                        ]
+                        if fallback_candidates.size:
+                            candidate_channels = pd.unique(
+                                channel_ids[fallback_candidates])
+                            target_radial_position = radial_positions[
+                                point_position]
+                            channel_distances = [
+                                np.median(np.abs(
+                                    radial_positions[fallback_candidates][
+                                        channel_ids[fallback_candidates]
+                                        == candidate_channel]
+                                    - target_radial_position
+                                ))
+                                for candidate_channel in candidate_channels
+                            ]
+                            nearest_order = np.argsort(channel_distances)[
+                                :channels_to_add]
+                            added_positions = [
+                                fallback_candidates[
+                                    channel_ids[fallback_candidates]
+                                    == candidate_channels[channel_order]
+                                ]
+                                for channel_order in nearest_order
+                            ]
+                            if added_positions:
+                                neighbor_positions = np.concatenate((
+                                    neighbor_positions,
+                                    *added_positions,
+                                ))
+                                fallback_point_positions.add(point_position)
+
+                metric_flags = {}
+                for metric, metric_values, point_value, metric_threshold in (
+                    ('upper_value', quantity_values,
+                     quantity_values[point_position], upper_value_threshold),
+                    ('relative_error', relative_errors,
+                     relative_errors[point_position], relative_error_threshold)):
+                    if np.isnan(point_value):
+                        continue
+                    valid_neighbors = neighbor_positions[
+                        np.isfinite(metric_values[neighbor_positions])]
+                    if valid_neighbors.size < min_neighbors:
+                        insufficient[metric] += 1
+                        insufficient_support_rows.append({
+                            'row_index': filtered_df.index[point_position],
+                            'system': system,
+                            'shot': filtered_df['shot'].iloc[point_position]
+                            if 'shot' in filtered_df.columns else None,
+                            'time': times[point_position],
+                            'channel_index': channel_ids[point_position]
+                            if channel_ids is not None else None,
+                            'quantity': quantity,
+                            'metric': metric,
+                            'reason': 'min_neighbors',
+                            'neighbor_count': int(valid_neighbors.size),
+                            'radial_support': None,
+                            'temporal_support': None,
+                        })
+                        continue
+
+                    if 'channel_index' in filtered_df.columns:
+                        neighbor_channels = channel_ids[valid_neighbors]
+                        if pd.notna(channel_ids[point_position]):
+                            neighbor_channels = np.append(
+                                neighbor_channels, channel_ids[point_position])
+                        radial_support = pd.Series(
+                            neighbor_channels).nunique(dropna=True)
+                    else:
+                        radial_support = np.unique(radii[valid_neighbors]).size
+                    temporal_support = np.unique(times[valid_neighbors]).size
+                    if (radial_support < min_radial_neighbors
+                            or temporal_support < min_temporal_neighbors):
+                        insufficient[metric] += 1
+                        reasons = []
+                        if radial_support < min_radial_neighbors:
+                            reasons.append('min_radial_neighbors')
+                        if temporal_support < min_temporal_neighbors:
+                            reasons.append('min_temporal_neighbors')
+                        insufficient_support_rows.append({
+                            'row_index': filtered_df.index[point_position],
+                            'system': system,
+                            'shot': filtered_df['shot'].iloc[point_position]
+                            if 'shot' in filtered_df.columns else None,
+                            'time': times[point_position],
+                            'channel_index': channel_ids[point_position]
+                            if channel_ids is not None else None,
+                            'quantity': quantity,
+                            'metric': metric,
+                            'reason': '; '.join(reasons),
+                            'neighbor_count': int(valid_neighbors.size),
+                            'radial_support': int(radial_support),
+                            'temporal_support': int(temporal_support),
+                        })
+                        continue
+
+                    local_threshold = _upper_mad_threshold(
+                        metric_values[valid_neighbors], metric_threshold)
+                    comparison_tolerance = (
+                        np.finfo(float).eps
+                        * 16
+                        * max(abs(local_threshold), 1.0)
+                    )
+                    metric_flags[metric] = (
+                        point_value > local_threshold + comparison_tolerance)
+
+                value_outlier = metric_flags.get('upper_value', False)
+                relative_error_outlier = metric_flags.get('relative_error', False)
+                if value_outlier:
+                    criteria['upper_value'] += 1
+                    reasons_by_position.setdefault(point_position, []).append(
+                        f'{quantity}_statistical_upper_value_outlier')
+                if relative_error_outlier:
+                    criteria['relative_error'] += 1
+                    reasons_by_position.setdefault(point_position, []).append(
+                        f'{quantity}_statistical_relative_error_outlier')
+                if value_outlier and relative_error_outlier:
+                    criteria['both'] += 1
+                if value_outlier or relative_error_outlier:
+                    removed_mask[point_position] = True
+                    removed_for_group.add(point_position)
+
+        if fallback_point_positions:
+            fallback_neighbor_counts[system] = (
+                fallback_neighbor_counts.get(system, 0)
+            + len(fallback_point_positions))
+
+    filter_counts = {
+        key: len(positions)
+        for key, positions in removed_positions_by_group.items()
+        if positions
+    }
+    reason_values = filtered_df['filter_reason'].astype(str).to_numpy(copy=True)
+    for position, additions in reasons_by_position.items():
+        current = reason_values[position]
+        reason_values[position] = '; '.join(
+            value for value in (current, *additions) if value)
+    filtered_df['filter_reason'] = reason_values
+    removed_positions = np.flatnonzero(removed_mask)
+    keep_values = filtered_df['keep'].to_numpy(dtype=bool)
+    keep_values[removed_positions] = False
+    filtered_df['keep'] = keep_values
+
+    metadata = {
+        'removed_rows': filtered_df.iloc[removed_positions].copy(),
+        'filter_counts': filter_counts,
+        'criteria_counts': criteria_counts,
+        'insufficient_support_counts': insufficient_support_counts,
+        'insufficient_support_rows': pd.DataFrame(
+            insufficient_support_rows,
+            columns=[
+                'row_index', 'system', 'shot', 'time', 'channel_index',
+                'quantity', 'metric', 'reason', 'neighbor_count',
+                'radial_support', 'temporal_support',
+            ],
+        ),
+        'fallback_neighbor_counts': fallback_neighbor_counts,
+        'keep_mask': ~removed_mask,
+    }
+    if report:
+        for key, counts in criteria_counts.items():
+            insufficient = insufficient_support_counts[key]
+            print(f'[Local Statistical Outlier Report: {key}]')
+            print(
+                f"Removed {filter_counts.get(key, 0)} rows; upper-value: "
+                f"{counts['upper_value']}, relative-error: "
+                f"{counts['relative_error']}, both: {counts['both']}."
+            )
+            print(
+                'Skipped for insufficient support; upper-value: '
+                f"{insufficient['upper_value']}, relative-error: "
+                f"{insufficient['relative_error']}."
+            )
+
+    result = filtered_df.loc[filtered_df['keep']].copy()
+    if return_metadata:
+        return result, metadata
+    return result
 
 
 def _build_flat_dataframe(system, time, r, z, rho, r_midplane,
@@ -791,19 +1312,44 @@ def compute_r_midplane(time, rhop_matrix, z_mag_resampled, equ, mapping_method='
     raise ValueError(f"Unsupported mapping_method: {mapping_method}")
 
 
-def _apply_preprocessing_filters(all_df, outlier_config=None, rhop_filter=None,
-                                 channel_trim=None, report_outliers=False):
+def _apply_preprocessing_filters(
+        all_df, outlier_config=None, rhop_filter=None, channel_trim=None,
+        report_outliers=False, local_statistical_outlier_config=None):
     all_df, rhop_metadata = _apply_rhop_filter(
         all_df, rhop_filter=rhop_filter, report=True, return_metadata=True)
     all_df, trim_metadata = _apply_channel_trim(
         all_df, channel_trim=channel_trim, report=True, return_metadata=True)
-    all_df, outlier_metadata = _apply_outlier_filters(
-        all_df, outlier_config=outlier_config, report=report_outliers,
-        return_metadata=True)
+    validity_metadata = None
+    statistical_metadata = None
+    statistical_enabled = (
+        local_statistical_outlier_config
+        and local_statistical_outlier_config.get('enabled', True))
+    if statistical_enabled:
+        all_df, validity_metadata = _apply_measurement_validity_filters(
+            all_df, report=report_outliers, return_metadata=True)
+    if local_statistical_outlier_config is not None:
+        all_df, statistical_metadata = apply_local_statistical_outlier_filters(
+            all_df,
+            config=local_statistical_outlier_config,
+            report=report_outliers,
+            return_metadata=True,
+        )
+    if outlier_config is None:
+        outlier_metadata = {
+            'removed_rows': all_df.iloc[0:0].copy(),
+            'filter_counts': {},
+            'keep_mask': np.ones(len(all_df), dtype=bool),
+        }
+    else:
+        all_df, outlier_metadata = _apply_outlier_filters(
+            all_df, outlier_config=outlier_config, report=report_outliers,
+            return_metadata=True)
     removed_frames = [
         metadata['removed_rows']
-        for metadata in (rhop_metadata, trim_metadata, outlier_metadata)
-        if not metadata['removed_rows'].empty
+        for metadata in (
+                rhop_metadata, trim_metadata, validity_metadata,
+                statistical_metadata, outlier_metadata)
+        if metadata is not None and not metadata['removed_rows'].empty
     ]
     metadata = {
         'removed_rows': (
@@ -813,6 +1359,7 @@ def _apply_preprocessing_filters(all_df, outlier_config=None, rhop_filter=None,
         'filter_counts': {
             **rhop_metadata['filter_counts'],
             **trim_metadata['filter_counts'],
+            **(validity_metadata or {}).get('filter_counts', {}),
             **outlier_metadata['filter_counts'],
         },
         'channels_removed': {
@@ -822,11 +1369,60 @@ def _apply_preprocessing_filters(all_df, outlier_config=None, rhop_filter=None,
         },
         'channels_before': rhop_metadata['channels_before'],
         'keep_mask': outlier_metadata['keep_mask'],
+        'measurement_validity_metadata': validity_metadata,
+        'local_statistical_outlier_metadata': statistical_metadata,
     }
     return all_df, metadata
 
 
-def convert_vta_to_r_midplane(ts_dict, interval=None, r_edge_offset=0.008, mapping_method='sfutils', outlier_config=None, rhop_filter=None, channel_trim=None, report_outliers=False, return_metadata=False, apply_filters=True):
+def apply_shot_wide_statistical_outlier_filter(
+        ts_df, config=None, rhop_filter=None, channel_trim=None,
+        report=False, return_metadata=False):
+    """Apply local statistical filtering using the complete mapped shot."""
+    source_df = ts_df.copy().reset_index(drop=True)
+    if not config or not config.get('enabled', True):
+        if return_metadata:
+            return source_df, None
+        return source_df
+
+    valid_source_df, validity_metadata = _apply_measurement_validity_filters(
+        source_df, report=report, return_metadata=True)
+    support_df = _apply_rhop_filter(valid_source_df, rhop_filter=rhop_filter)
+    support_df = _apply_channel_trim(support_df, channel_trim=channel_trim)
+    _, metadata = apply_local_statistical_outlier_filters(
+        support_df,
+        config=config,
+        report=report,
+        return_metadata=True,
+    )
+    statistical_removed_rows = metadata['removed_rows']
+    validity_removed_rows = validity_metadata['removed_rows']
+    removed_indices = np.union1d(
+        statistical_removed_rows.index.to_numpy(dtype=int),
+        validity_removed_rows.index.to_numpy(dtype=int),
+    )
+    result = source_df.drop(index=removed_indices).copy()
+    keep_mask = np.ones(len(source_df), dtype=bool)
+    keep_mask[removed_indices] = False
+    metadata['keep_mask'] = keep_mask
+    metadata['statistical_removed_rows'] = statistical_removed_rows
+    metadata['validity_filter_counts'] = validity_metadata['filter_counts']
+    metadata['validity_filter_scope'] = 'shot'
+    metadata['removed_rows'] = pd.concat((
+        validity_removed_rows,
+        statistical_removed_rows,
+    )).sort_index()
+    metadata['scope'] = 'shot'
+    if return_metadata:
+        return result, metadata
+    return result
+
+
+def convert_vta_to_r_midplane(
+        ts_dict, interval=None, r_edge_offset=0.008, mapping_method='sfutils',
+    outlier_config=None, rhop_filter=None, channel_trim=None,
+    report_outliers=False, return_metadata=False, apply_filters=True,
+    local_statistical_outlier_config=None):
     """Convert VTA core/edge coordinates to midplane radius and return a flat DataFrame."""
     vta = ts_dict['vta']
     equ = ts_dict['equ']
@@ -905,6 +1501,7 @@ def convert_vta_to_r_midplane(ts_dict, interval=None, r_edge_offset=0.008, mappi
     all_df, metadata = _apply_preprocessing_filters(
         all_df,
         outlier_config=outlier_config,
+        local_statistical_outlier_config=local_statistical_outlier_config,
         rhop_filter=rhop_filter,
         channel_trim=channel_trim,
         report_outliers=report_outliers,
@@ -914,14 +1511,82 @@ def convert_vta_to_r_midplane(ts_dict, interval=None, r_edge_offset=0.008, mappi
     return all_df
 
 
-def preprocess_ts_data(ts_dict, interval=None, r_edge_offset=0.008, mapping_method='sfutils', outlier_config=None, rhop_filter=None, channel_trim=None, report_outliers=False, return_metadata=False, apply_filters=True):
+def preprocess_ts_data(
+    ts_dict, interval=None, r_edge_offset=0.008, mapping_method='sfutils',
+    outlier_config=None, rhop_filter=None, channel_trim=None,
+    report_outliers=False, return_metadata=False, apply_filters=True,
+    local_statistical_outlier_config=None):
     """Preprocess VTA TS data and produce a DataFrame with R_midplane coordinates."""
+    if (interval is not None and apply_filters
+            and local_statistical_outlier_config
+            and local_statistical_outlier_config.get('enabled', True)):
+        mapped_shot = convert_vta_to_r_midplane(
+            ts_dict,
+            interval=None,
+            r_edge_offset=r_edge_offset,
+            mapping_method=mapping_method,
+            apply_filters=False,
+        )
+        mapped_shot, statistical_metadata = (
+            apply_shot_wide_statistical_outlier_filter(
+                mapped_shot,
+                config=local_statistical_outlier_config,
+                rhop_filter=rhop_filter,
+                channel_trim=channel_trim,
+                report=report_outliers,
+                return_metadata=True,
+            )
+        )
+        interval_mask = _interval_mask(
+            mapped_shot['time'].to_numpy(dtype=float), interval)
+        interval_df = mapped_shot.loc[interval_mask].copy().reset_index(drop=True)
+        removed_rows = statistical_metadata['removed_rows']
+        removed_rows = removed_rows.loc[_interval_mask(
+            removed_rows['time'].to_numpy(dtype=float), interval)].copy()
+        interval_before_statistical = pd.concat(
+            [interval_df, removed_rows], ignore_index=True)
+        filtered_interval, metadata = _apply_preprocessing_filters(
+            interval_df,
+            outlier_config=outlier_config,
+            rhop_filter=rhop_filter,
+            channel_trim=channel_trim,
+            report_outliers=report_outliers,
+            local_statistical_outlier_config=None,
+        )
+        metadata['channels_before'] = {
+            system: int(interval_before_statistical.loc[
+                interval_before_statistical['system'].eq(system),
+                'channel_index',
+            ].nunique())
+            for system in ('core', 'edge')
+        }
+        statistical_metadata = dict(statistical_metadata)
+        statistical_metadata['removed_rows'] = removed_rows
+        if 'statistical_removed_rows' in statistical_metadata:
+            statistical_removed_rows = statistical_metadata[
+                'statistical_removed_rows']
+            statistical_metadata['statistical_removed_rows'] = (
+                statistical_removed_rows.loc[_interval_mask(
+                    statistical_removed_rows['time'].to_numpy(dtype=float),
+                    interval,
+                )].copy()
+            )
+        statistical_metadata['removed_rows_scope'] = 'interval'
+        metadata['local_statistical_outlier_metadata'] = statistical_metadata
+        if not removed_rows.empty:
+            metadata['removed_rows'] = pd.concat(
+                [metadata['removed_rows'], removed_rows], ignore_index=True)
+        if return_metadata:
+            return filtered_interval, metadata
+        return filtered_interval
+
     return convert_vta_to_r_midplane(
         ts_dict,
         interval=interval,
         r_edge_offset=r_edge_offset,
         mapping_method=mapping_method,
         outlier_config=outlier_config,
+        local_statistical_outlier_config=local_statistical_outlier_config,
         rhop_filter=rhop_filter,
         channel_trim=channel_trim,
         report_outliers=report_outliers,
@@ -929,12 +1594,14 @@ def preprocess_ts_data(ts_dict, interval=None, r_edge_offset=0.008, mapping_meth
         apply_filters=apply_filters)
 
 
-def apply_preprocessing_filters(ts_df, outlier_config=None, rhop_filter=None,
-                                channel_trim=None, report_outliers=False):
+def apply_preprocessing_filters(
+    ts_df, outlier_config=None, rhop_filter=None, channel_trim=None,
+    report_outliers=False, local_statistical_outlier_config=None):
     """Apply interval-level filters to an already mapped TS DataFrame."""
     return _apply_preprocessing_filters(
         ts_df,
         outlier_config=outlier_config,
+        local_statistical_outlier_config=local_statistical_outlier_config,
         rhop_filter=rhop_filter,
         channel_trim=channel_trim,
         report_outliers=report_outliers,

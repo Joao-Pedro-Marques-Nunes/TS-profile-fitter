@@ -62,7 +62,10 @@ class PhysicsCache:
 
     def get_or_compute(self, kind, key_data, compute):
         if not self.enabled_by_kind.get(kind, False):
-            return compute(), False
+            value = compute()
+            if self.on_new_cache is not None:
+                self.on_new_cache(kind, key_data, value)
+            return value, False
         path = self._path(kind, key_data)
         if path.exists():
             cached = self._read(path)
@@ -85,7 +88,7 @@ class PhysicsCache:
 
     def physics_inputs(self, shot_id, interval, equilibrium, compute):
         key = {
-            'version': 'physics_inputs_v1',
+            'version': 'physics_inputs_v2',
             'shot_id': int(shot_id),
             't_begin': float(interval['t_begin']),
             't_end': float(interval['t_end']),

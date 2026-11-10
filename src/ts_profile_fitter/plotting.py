@@ -12,8 +12,21 @@ except Exception:  # pragma: no cover
 
 from .fitting import modified_tanh
 
+PROFILE_RADIUS_LABEL = r'$R_{\mathrm{mid}}$ [m]'
+_FIT_METRICS_LOCATIONS = {
+    'upper right': (0.98, 0.98, 'right', 'top'),
+    'upper left': (0.02, 0.98, 'left', 'top'),
+    'lower right': (0.98, 0.02, 'right', 'bottom'),
+    'lower left': (0.02, 0.02, 'left', 'bottom'),
+    'center right': (0.98, 0.5, 'right', 'center'),
+    'center left': (0.02, 0.5, 'left', 'center'),
+    'upper center': (0.5, 0.98, 'center', 'top'),
+    'lower center': (0.5, 0.02, 'center', 'bottom'),
+    'center': (0.5, 0.5, 'center', 'center'),
+}
 
-def _make_profile_title(title, nshot, interval):
+
+def _make_profile_title(title, nshot, interval, equilibrium=None):
     if title is not None:
         return title
 
@@ -27,6 +40,8 @@ def _make_profile_title(title, nshot, interval):
         else:
             t_begin, t_end = interval
         title_parts.append(f'[{float(t_begin):.3f}, {float(t_end):.3f}] s')
+    if equilibrium:
+        title_parts.append(str(equilibrium))
     return ', '.join(title_parts) if title_parts else None
 
 
@@ -62,12 +77,58 @@ def _save_final_figure(fig, fig_name, directory, save_fig):
         return
     if save_figure_ipfn is None:
         raise ImportError('ipfnpytools.save_figure is not available; install ipfnpytools first.')
-    save_figure_ipfn(fig, name=fig_name, directory=directory)
+    save_figure_ipfn(fig, name=fig_name, directory=directory, format='pdf')
 
 
 def _restore_grids(axes):
     for axis in np.asarray(axes, dtype=object).ravel():
         axis.grid(True)
+
+
+def _add_fit_metric_annotations(axes, quantities, fit_metrics, fit_metrics_loc):
+    if not fit_metrics:
+        return
+    axes = np.asarray(axes, dtype=object).reshape(-1)
+    for item, axis in zip(quantities, axes):
+        quantity_metrics = fit_metrics.get(item, {})
+        values_text = []
+        reduced_chi2 = quantity_metrics.get('reduced_chi2', np.nan)
+        weighted_sse = quantity_metrics.get('weighted_sse', np.nan)
+        if np.isfinite(reduced_chi2):
+            values_text.append(
+                f'$\\chi^2_{{\\mathrm{{red}}}}$={reduced_chi2:.3g}')
+        if np.isfinite(weighted_sse):
+            values_text.append(f'$\\chi^2$={weighted_sse:.3g}')
+        if not values_text:
+            continue
+        metric_text = f'{item} fit quality\n' + '\n'.join(values_text)
+        location = (
+            fit_metrics_loc.get(item, 'upper right')
+            if isinstance(fit_metrics_loc, dict) else fit_metrics_loc
+        )
+        try:
+            x_pos, y_pos, horizontal_alignment, vertical_alignment = (
+                _FIT_METRICS_LOCATIONS[location])
+        except (KeyError, TypeError) as error:
+            valid_locations = ', '.join(_FIT_METRICS_LOCATIONS)
+            raise ValueError(
+                f'fit_metrics_loc must be one of: {valid_locations}.') from error
+        axis.text(
+            x_pos,
+            y_pos,
+            metric_text,
+            transform=axis.transAxes,
+            ha=horizontal_alignment,
+            va=vertical_alignment,
+            fontsize='small',
+            bbox={
+                'boxstyle': 'round,pad=0.25',
+                'facecolor': 'white',
+                'edgecolor': '0.7',
+                'alpha': 0.85,
+            },
+            zorder=10,
+        )
 
 
 def _finite_values(*arrays):
@@ -155,6 +216,12 @@ def plot_profile_fit(
     nshot=None,
     interval=None,
     fig_name=None,
+    show_fit=True,
+    x_mins=None,
+    x_maxs=None,
+    y_mins=None,
+    y_maxs=None,
+    equilibrium=None,
     **plots_kw,
 ):
     """Plot core/edge profile data and an optional modified-tanh fit.
@@ -181,7 +248,8 @@ def plot_profile_fit(
     x_min = np.min(x_core) if x_core.size > 0 else np.min(x_edge)
     x_max = np.max(x_edge) if x_edge.size > 0 else np.max(x_core)
 
-    if popt is None or (np.asarray(popt).size == 0) or np.isnan(np.asarray(popt)).all():
+    if (not show_fit or popt is None or np.asarray(popt).size == 0
+            or np.isnan(np.asarray(popt)).all()):
         y_fit = None
     else:
         x_fit = np.linspace(x_min, x_max, 500)
@@ -192,29 +260,45 @@ def plot_profile_fit(
     if time_e is None:
         time_e = np.array([], dtype=float)
 
-    x_data = [x_core, x_core, x_edge, x_edge]
-    y_data = [y_core, y_core, y_edge, y_edge]
-    ey_data = [y_err_core, None, y_err_edge, None]
-    z_data = [None, _build_time_color_values(time_c, x_core.size), None, _build_time_color_values(time_e, x_edge.size)]
-    styles = ['', '', '', '']
-    markers = [None, 'x', None, 'v']
-    marker_sizes = [0, 14, 0, 14]
-    time_values = np.concatenate([time_c, time_e])
+    x_data = []
+    y_data = []
+    ey_data = []
+    z_data = []
+    styles = []
+    markers = []
+    marker_sizes = []
+    labels = []
+    time_values = _finite_values(time_c, time_e)
     marker_plot_kw = {}
     if time_values.size:
+        time_min = float(np.min(time_values))
+        time_max = float(np.max(time_values))
+        if time_min == time_max:
+            time_max = float(np.nextafter(time_max, np.inf))
         marker_plot_kw = {
-            'vmin': np.nanmin(time_values),
-            'vmax': np.nanmax(time_values),
+            'vmin': time_min,
+            'vmax': time_max,
             'cmap': 'plasma',
         }
-    else:
-        marker_sizes = [0, 6, 0, 6]
-    plot_kw_list = [
-        dict(ecolor='blue', alpha=0.2),
-        marker_plot_kw.copy(),
-        dict(ecolor='blue', alpha=0.2),
-        marker_plot_kw.copy(),
-    ]
+    plot_kw_list = []
+
+    for x, y, y_err, time, label, marker in (
+            (x_core, y_core, y_err_core, time_c, 'Core TS', 'x'),
+            (x_edge, y_edge, y_err_edge, time_e, 'Edge TS', 'v')):
+        if x.size == 0:
+            continue
+        x_data.extend((x, x))
+        y_data.extend((y, y))
+        ey_data.extend((y_err, None))
+        z_data.extend((None, _build_time_color_values(time, x.size)))
+        styles.extend(('', ''))
+        markers.extend((None, marker))
+        marker_sizes.extend((0, 16 if time_values.size else 8))
+        labels.extend((None, label))
+        plot_kw_list.extend((
+            dict(ecolor='blue', alpha=0.2),
+            marker_plot_kw.copy(),
+        ))
 
     if y_fit is not None:
         x_data.append(x_fit)
@@ -225,26 +309,37 @@ def plot_profile_fit(
         markers.append(None)
         marker_sizes.append(None)
         plot_kw_list.append(dict(color='red'))
+        labels.append('Modified-tanh fit')
 
     if y_core_out is not None:
-        x_data.append(x_core if x_core_out is None else _as_1d_float_array(x_core_out))
-        y_data.append(np.asarray(y_core_out, dtype=float))
-        ey_data.append(_as_1d_float_array(y_err_core_out))
-        z_data.append(None)
-        styles.append('')
-        markers.append('o')
-        marker_sizes.append(6)
-        plot_kw_list.append(dict(color='orange', alpha=0.2))
+        x_out = x_core if x_core_out is None else _as_1d_float_array(x_core_out)
+        y_out = np.asarray(y_core_out, dtype=float)
+        if x_out.size:
+            x_data.append(x_out)
+            y_data.append(y_out)
+            ey_data.append(_as_1d_float_array(y_err_core_out))
+            z_data.append(None)
+            styles.append('')
+            markers.append('o')
+            marker_sizes.append(6)
+            plot_kw_list.append(dict(
+                color='orange', ecolor='orange', alpha=0.12))
+            labels.append('Rejected core')
 
     if y_edge_out is not None:
-        x_data.append(x_edge if x_edge_out is None else _as_1d_float_array(x_edge_out))
-        y_data.append(np.asarray(y_edge_out, dtype=float))
-        ey_data.append(_as_1d_float_array(y_err_edge_out))
-        z_data.append(None)
-        styles.append('')
-        markers.append('s')
-        marker_sizes.append(6)
-        plot_kw_list.append(dict(color='red', alpha=0.2))
+        x_out = x_edge if x_edge_out is None else _as_1d_float_array(x_edge_out)
+        y_out = np.asarray(y_edge_out, dtype=float)
+        if x_out.size:
+            x_data.append(x_out)
+            y_data.append(y_out)
+            ey_data.append(_as_1d_float_array(y_err_edge_out))
+            z_data.append(None)
+            styles.append('')
+            markers.append('s')
+            marker_sizes.append(6)
+            plot_kw_list.append(dict(
+                color='red', ecolor='red', alpha=0.12))
+            labels.append('Rejected edge')
 
     save_figure_kw = {'directory': directory} if directory is not None else None
     if fig_name is None:
@@ -260,6 +355,13 @@ def plot_profile_fit(
         ey=ey_data,
         x_labels=x_labels,
         y_labels=y_labels,
+        labels=labels,
+        x_mins=x_mins,
+        x_maxs=x_maxs,
+        y_mins=y_mins,
+        y_maxs=y_maxs,
+        z_labels='Time',
+        z_units='s',
         boxes=0,
         write_legends=True,
         linestyles=styles,
@@ -268,12 +370,289 @@ def plot_profile_fit(
         close=False,
         save_fig=False,
         show=False,
-        title=_make_profile_title(plots_kw.pop('title', None), nshot, interval),
+        title=_make_profile_title(
+            plots_kw.pop('title', None), nshot, interval, equilibrium),
         fig_name=fig_name,
         save_figure_kw=save_figure_kw,
         plot_kw=plot_kw_list,
         **plots_kw,
     )
+    _restore_grids(ax)
+    _add_interval_label(fig, interval)
+    _save_final_figure(fig, fig_name, directory, save_fig)
+    if show:
+        plt.show()
+    if close:
+        plt.close(fig)
+    return fig, ax
+
+
+def _statistical_outlier_groups(filter_reason):
+    tags = {
+        tag.strip()
+        for tag in str(filter_reason).split(';')
+        if tag.strip()
+    }
+    groups = []
+    statistical_tags = {
+        tag for tag in tags
+        if tag.startswith(('Te_statistical_', 'Ne_statistical_'))
+    }
+    negative_zero_tags = {
+        tag for tag in tags
+        if tag.endswith((
+            '_negative_value', '_negative_error', '_zero_value', '_zero_error'))
+    }
+    if any(tag.startswith('Te_statistical_') for tag in statistical_tags):
+        groups.append('Te_stat')
+    if any(tag.startswith('Ne_statistical_') for tag in statistical_tags):
+        groups.append('Ne_stat')
+    if negative_zero_tags:
+        groups.append('Negative or zero')
+    other_tags = tags - statistical_tags - negative_zero_tags
+    other_tags -= {'Te_outlier', 'Ne_outlier'}
+    if other_tags or (tags and not groups):
+        groups.append('Other')
+    if not tags:
+        groups.append('core channel removal')
+    return groups
+
+
+def plot_filtered_profile_with_outliers(
+    filtered, outliers, quantity, directory=None, close=False,
+        save_fig=False, show=True, nshot=None, interval=None,
+    fig_name=None, title=None, popt=None, show_fit=True,
+    show_outliers=True, fit_metrics=None, fit_metrics_loc='upper right',
+    x_mins=None, x_maxs=None, y_mins=None, y_maxs=None,
+    equilibrium=None, **plots_kw):
+    """Plot filtered TS data and rejected points in one or more boxes.
+
+    Pass a quantity name for a single profile or a sequence such as
+    ``('Te', 'Ne')`` to show multiple profiles in one figure.
+    """
+    if ipfn_plots is None:
+        raise ImportError('ipfnpytools.plot.plots is not available; install ipfnpytools first.')
+    quantities = (quantity,) if isinstance(quantity, str) else tuple(quantity)
+    if (not quantities
+            or any(item not in ('Te', 'Ne') for item in quantities)
+            or len(set(quantities)) != len(quantities)):
+        raise ValueError("quantity must be 'Te', 'Ne', or a sequence of unique values.")
+    required = {'system', 'r_midplane', 'time'}
+    for item in quantities:
+        required.update((item, f'{item}_err'))
+    missing = required.difference(filtered.columns)
+    if missing:
+        raise ValueError(
+            f'Filtered plot data is missing columns: {sorted(missing)}')
+    if show_outliers:
+        if outliers is None:
+            raise ValueError('Outlier plot data is required when show_outliers=True.')
+        missing = required.difference(outliers.columns)
+        if missing:
+            raise ValueError(
+                f'Outlier plot data is missing columns: {sorted(missing)}')
+        if 'filter_reason' not in outliers.columns:
+            raise ValueError('Outlier plot data is missing the filter_reason column.')
+
+    time_values = _finite_values(filtered['time'])
+    time_plot_kw = {}
+    if time_values.size:
+        time_min = float(np.min(time_values))
+        time_max = float(np.max(time_values))
+        if time_min == time_max:
+            time_max = float(np.nextafter(time_max, np.inf))
+        time_plot_kw = {
+            'vmin': time_min,
+            'vmax': time_max,
+            'cmap': 'plasma',
+        }
+
+    x_data = []
+    y_data = []
+    ey_data = []
+    z_data = []
+    labels = []
+    linestyles = []
+    markers = []
+    marker_sizes = []
+    plot_kw_list = []
+    boxes = []
+
+    def add_dataset(box, x, y, ey, z, label, linestyle, marker, marker_size,
+                    plot_kw):
+        x_data.append(x)
+        y_data.append(y)
+        ey_data.append(ey)
+        z_data.append(z)
+        labels.append(label)
+        linestyles.append(linestyle)
+        markers.append(marker)
+        marker_sizes.append(marker_size)
+        plot_kw_list.append(plot_kw)
+        boxes.append(box)
+
+    outlier_style = {
+        'Other': ('0.25', 'x'),
+        'Negative or zero': ('tab:red', 'D'),
+        'core channel removal': ('tab:green', 'P'),
+        'Te_stat': ('tab:orange', '^'),
+        'Ne_stat': ('tab:blue', 's'),
+    }
+    outlier_groups = (
+        outliers['filter_reason'].map(_statistical_outlier_groups)
+        if show_outliers else None
+    )
+    y_labels = []
+    for box, item in enumerate(quantities):
+        core = filtered.loc[filtered['system'].eq('core')]
+        edge = filtered.loc[filtered['system'].eq('edge')]
+        x_core = np.asarray(core['r_midplane'], dtype=float)
+        x_edge = np.asarray(edge['r_midplane'], dtype=float)
+        y_core = np.asarray(core[item], dtype=float)
+        y_edge = np.asarray(edge[item], dtype=float)
+        y_err_core = np.asarray(core[f'{item}_err'], dtype=float)
+        y_err_edge = np.asarray(edge[f'{item}_err'], dtype=float)
+        time_core = np.asarray(core['time'], dtype=float)
+        time_edge = np.asarray(edge['time'], dtype=float)
+
+        outlier_x = outliers['r_midplane'] if show_outliers else None
+        finite_x = _finite_values(x_core, x_edge, outlier_x)
+        if finite_x.size == 0:
+            raise ValueError('No finite radial coordinates available for plotting.')
+
+        for x, y, y_err, time, label, marker in (
+                (x_core, y_core, y_err_core, time_core, 'Core TS', 'o'),
+                (x_edge, y_edge, y_err_edge, time_edge, 'Edge TS', 'v')):
+            if x.size == 0:
+                continue
+            add_dataset(
+                box, x, y, y_err, None, None, '', None, 0,
+                {'ecolor': 'blue', 'alpha': 0.2})
+            add_dataset(
+                box, x, y, None,
+                _build_time_color_values(time, x.size), label, '', marker, 9,
+                time_plot_kw.copy())
+
+        fit_params = popt.get(item) if isinstance(popt, dict) else (
+            popt if len(quantities) == 1 else None)
+        fit_values = (
+            np.asarray(fit_params, dtype=float)
+            if fit_params is not None else np.array([], dtype=float))
+        if (show_fit and fit_values.size and not np.isnan(fit_values).all()):
+            x_fit = np.linspace(np.min(finite_x), np.max(finite_x), 500)
+            y_fit = modified_tanh(x_fit, *fit_values)
+            add_dataset(
+                box, x_fit, y_fit, None, None, 'Modified-tanh fit', '-', None,
+                None, {'color': 'red'})
+
+        if show_outliers:
+            for group_name, (color, marker) in outlier_style.items():
+                group_mask = outlier_groups.map(
+                    lambda groups: group_name in groups)
+                group_rows = outliers.loc[group_mask]
+                if group_rows.empty:
+                    continue
+                add_dataset(
+                    box,
+                    group_rows['r_midplane'].to_numpy(dtype=float),
+                    group_rows[item].to_numpy(dtype=float),
+                    group_rows[f'{item}_err'].to_numpy(dtype=float),
+                    None, group_name, '', marker, 6,
+                    {
+                        'color': color,
+                        'ecolor': color,
+                        'alpha': 0.28,
+                        'zorder': 5,
+                    })
+        y_labels.append('Te [eV]' if item == 'Te' else 'Ne [m$^{-3}$]')
+
+    if not x_data:
+        raise ValueError('No data available for plotting.')
+
+    if fig_name is None:
+        quantity_slug = '_'.join(item.lower() for item in quantities)
+        fig_name = (
+            f'{nshot}_{quantity_slug}_outlier_origins'
+            if nshot is not None else f'{quantity_slug}_outlier_origins'
+        )
+    fit_metric_texts = {}
+    if fit_metrics:
+        for item in quantities:
+            quantity_metrics = fit_metrics.get(item, {})
+            values_text = []
+            reduced_chi2 = quantity_metrics.get('reduced_chi2', np.nan)
+            weighted_sse = quantity_metrics.get('weighted_sse', np.nan)
+            if np.isfinite(reduced_chi2):
+                values_text.append(
+                    f'$\\chi^2_{{\\mathrm{{red}}}}$={reduced_chi2:.3g}')
+            if np.isfinite(weighted_sse):
+                values_text.append(f'$\\chi^2$={weighted_sse:.3g}')
+            if values_text:
+                fit_metric_texts[item] = (
+                    f'{item} fit quality\n' + '\n'.join(values_text))
+    plot_title = _make_profile_title(title, nshot, interval, equilibrium)
+
+    fig, ax = ipfn_plots(
+        x=x_data,
+        y=y_data,
+        z=z_data,
+        ey=ey_data,
+        x_labels=PROFILE_RADIUS_LABEL,
+        y_labels=y_labels[0] if len(y_labels) == 1 else y_labels,
+        labels=labels,
+        x_mins=x_mins,
+        x_maxs=x_maxs,
+        y_mins=y_mins,
+        y_maxs=y_maxs,
+        z_labels='Time [s]',
+        z_units='s',
+        boxes=boxes,
+        n_boxes=len(quantities),
+        write_legends=True,
+        linestyles=linestyles,
+        markers=markers,
+        markersizes=marker_sizes,
+        close=False,
+        save_fig=False,
+        show=False,
+        title=plot_title or None,
+        fig_name=fig_name,
+        save_figure_kw={'directory': directory} if directory is not None else None,
+        plot_kw=plot_kw_list,
+        **plots_kw,
+    )
+    axes = np.asarray(ax, dtype=object).reshape(-1)
+    for item, axis in zip(quantities, axes):
+        metric_text = fit_metric_texts.get(item)
+        if metric_text is None:
+            continue
+        location = (
+            fit_metrics_loc.get(item, 'upper right')
+            if isinstance(fit_metrics_loc, dict) else fit_metrics_loc
+        )
+        try:
+            x_pos, y_pos, horizontal_alignment, vertical_alignment = (
+                _FIT_METRICS_LOCATIONS[location])
+        except (KeyError, TypeError) as error:
+            valid_locations = ', '.join(_FIT_METRICS_LOCATIONS)
+            raise ValueError(
+                f'fit_metrics_loc must be one of: {valid_locations}.') from error
+        axis.text(
+            x_pos,
+            y_pos,
+            metric_text,
+            transform=axis.transAxes,
+            ha=horizontal_alignment,
+            va=vertical_alignment,
+            fontsize='small',
+            bbox={
+                'boxstyle': 'round,pad=0.25',
+                'facecolor': 'white',
+                'edgecolor': '0.7',
+                'alpha': 0.85,
+            },
+            zorder=10,
+        )
     _restore_grids(ax)
     _add_interval_label(fig, interval)
     _save_final_figure(fig, fig_name, directory, save_fig)
@@ -318,6 +697,177 @@ def plot_spline_profile_fit(
     """
     if ipfn_plots is None:
         raise ImportError('ipfnpytools.plot.plots is not available; install ipfnpytools first.')
+
+    if not isinstance(quantity, str):
+        try:
+            requested_quantities = tuple(quantity)
+        except TypeError as error:
+            raise ValueError(
+                "quantity must be 'Te', 'Ne', or a sequence of unique values.") from error
+        quantities = []
+        for item in requested_quantities:
+            if not isinstance(item, str) or item.lower() not in ('te', 'ne'):
+                raise ValueError(
+                    "quantity must be 'Te', 'Ne', or a sequence of unique values.")
+            quantities.append('Te' if item.lower() == 'te' else 'Ne')
+        if not quantities or len(set(quantities)) != len(quantities):
+            raise ValueError(
+                "quantity must be 'Te', 'Ne', or a sequence of unique values.")
+        quantities = tuple(quantities)
+
+        def quantity_array(values, item, name):
+            if isinstance(values, dict):
+                if item not in values:
+                    raise ValueError(f'{name} is missing quantity {item!r}.')
+                values = values[item]
+            elif len(quantities) > 1:
+                raise ValueError(
+                    f'{name} must be keyed by quantity for multiple profiles.')
+            return _as_1d_float_array(values)
+
+        title = plots_kw.pop('title', None)
+        fit_metrics = plots_kw.pop('fit_metrics', None)
+        fit_metrics_loc = plots_kw.pop('fit_metrics_loc', 'upper right')
+        equilibrium = plots_kw.pop('equilibrium', None)
+        x_fit = np.asarray(ds_out['R_mid_spl'], dtype=float).ravel()
+        x_core = np.asarray(x_core, dtype=float).ravel()
+        x_edge = np.asarray(x_edge, dtype=float).ravel()
+        time_c = (
+            np.array([], dtype=float) if time_c is None
+            else np.asarray(time_c, dtype=float).ravel())
+        time_e = (
+            np.array([], dtype=float) if time_e is None
+            else np.asarray(time_e, dtype=float).ravel())
+        time_values = _finite_values(time_c, time_e)
+        time_plot_kw = {'cmap': 'plasma'}
+        if time_values.size:
+            time_min = float(np.min(time_values))
+            time_max = float(np.max(time_values))
+            if time_min == time_max:
+                time_max = float(np.nextafter(time_max, np.inf))
+            time_plot_kw.update(vmin=time_min, vmax=time_max)
+
+        x_data = []
+        y_data = []
+        ey_data = []
+        z_data = []
+        styles = []
+        markers = []
+        marker_sizes = []
+        labels = []
+        box_indices = []
+        plot_kw_list = []
+        for box_index, item in enumerate(quantities):
+            quantity_key = item.lower()
+            spline_column = {'ne': 'ne_spl', 'te': 'Te_spl'}[quantity_key]
+            y_fit = np.asarray(ds_out[spline_column], dtype=float).ravel()
+            y_core_item = quantity_array(y_core, item, 'y_core')
+            y_edge_item = quantity_array(y_edge, item, 'y_edge')
+            y_err_core_item = quantity_array(y_err_core, item, 'y_err_core')
+            y_err_edge_item = quantity_array(y_err_edge, item, 'y_err_edge')
+
+            x_data.extend([x_core, x_core, x_edge, x_edge, x_fit])
+            y_data.extend([
+                y_core_item, y_core_item, y_edge_item, y_edge_item, y_fit])
+            ey_data.extend([y_err_core_item, None, y_err_edge_item, None, None])
+            z_data.extend([
+                None,
+                _build_time_color_values(time_c, x_core.size),
+                None,
+                _build_time_color_values(time_e, x_edge.size),
+                None,
+            ])
+            styles.extend(['', '', '', '', '-'])
+            markers.extend([None, 'x', None, 'v', None])
+            marker_sizes.extend([0, 14, 0, 14, None])
+            labels.extend([None, 'Core TS', None, 'Edge TS', 'Spline Fit'])
+            box_indices.extend([box_index] * 5)
+            plot_kw_list.extend([
+                dict(ecolor='blue', alpha=0.2),
+                dict(time_plot_kw),
+                dict(ecolor='blue', alpha=0.2),
+                dict(time_plot_kw),
+                dict(color='green'),
+            ])
+
+            quantity_knots = (
+                knot_pos.get(item) if isinstance(knot_pos, dict) else knot_pos)
+            if quantity_knots is not None:
+                quantity_knots = np.asarray(quantity_knots, dtype=float).ravel()
+                y_values = _finite_values(y_core_item, y_edge_item)
+                y_range = np.ptp(y_values) if y_values.size else 1.0
+                knot_y = np.min(y_values) - 0.05 * (y_range or 1.0)
+                x_data.append(quantity_knots)
+                y_data.append(np.full(quantity_knots.size, knot_y))
+                ey_data.append(None)
+                z_data.append(None)
+                styles.append('')
+                markers.append('o')
+                marker_sizes.append(4)
+                labels.append('Knots')
+                box_indices.append(box_index)
+                plot_kw_list.append(dict(color='blue', zorder=5))
+
+            for values, errors, name, marker, color in (
+                    (y_core_out, y_err_core_out, 'y_core_out', 'o', 'orange'),
+                    (y_edge_out, y_err_edge_out, 'y_edge_out', 's', 'green')):
+                if values is None:
+                    continue
+                x_data.append(x_core if name == 'y_core_out' else x_edge)
+                y_data.append(quantity_array(values, item, name))
+                ey_data.append(
+                    quantity_array(errors, item, f'{name}_err')
+                    if errors is not None else None)
+                z_data.append(None)
+                styles.append('')
+                markers.append(marker)
+                marker_sizes.append(9)
+                labels.append(None)
+                box_indices.append(box_index)
+                plot_kw_list.append(dict(color=color, alpha=0.8))
+
+        if fig_name is None:
+            quantity_slug = '_'.join(item.lower() for item in quantities)
+            fig_name = (
+                f'{nshot}_{quantity_slug}_spline_fit'
+                if nshot is not None else f'{quantity_slug}_spline_fit')
+        save_figure_kw = (
+            {'directory': directory} if directory is not None else None)
+        fig, ax = ipfn_plots(
+            x=x_data,
+            y=y_data,
+            z=z_data,
+            ey=ey_data,
+            x_labels=x_labels,
+            y_labels=y_labels,
+            boxes=box_indices,
+            n_boxes=len(quantities),
+            labels=labels,
+            z_labels='Time [s]',
+            z_units='s',
+            write_legends=True,
+            linestyles=styles,
+            markers=markers,
+            markersizes=marker_sizes,
+            close=False,
+            save_fig=False,
+            show=False,
+            title=_make_profile_title(title, nshot, interval, equilibrium),
+            fig_name=fig_name,
+            save_figure_kw=save_figure_kw,
+            plot_kw=plot_kw_list,
+            **plots_kw,
+        )
+        _add_fit_metric_annotations(
+            ax, quantities, fit_metrics, fit_metrics_loc)
+        _restore_grids(ax)
+        _add_interval_label(fig, interval)
+        _save_final_figure(fig, fig_name, directory, save_fig)
+        if show:
+            plt.show()
+        if close:
+            plt.close(fig)
+        return fig, ax
 
     quantity_key = quantity.lower()
     spline_column = {'ne': 'ne_spl', 'te': 'Te_spl'}.get(quantity_key)
@@ -453,7 +1003,7 @@ def plot_profile_comparison(
     Rsep_eqh=None,
     Rsep_spline=None,
     Rsep_mtanh=None,
-    x_labels='R_mid [m]',
+    x_labels=PROFILE_RADIUS_LABEL,
     y_labels=None,
     x_mins=None,
     x_maxs=None,
@@ -1160,7 +1710,7 @@ def plot_profile_summary(
             for quantity in ('Te', 'Ne'):
                 weighted_sse = method_metrics.get(quantity, {}).get('weighted_sse', np.nan)
                 if np.isfinite(weighted_sse):
-                    values_text.append(f'{quantity} wSSE={weighted_sse:.3g}')
+                    values_text.append(f'{quantity} $\\chi^2$={weighted_sse:.3g}')
             if values_text:
                 metric_labels.append(f'{method}: ' + ', '.join(values_text))
         if metric_labels:
@@ -1447,7 +1997,7 @@ def plot_profile_failure_diagnostic(
         'Density ($10^{19}$ m$^{-3}$)', 'Density ($10^{19}$ m$^{-3}$)',
         'Temperature (keV)', 'Temperature (keV)',
     ]
-    x_labels = ['R midplane (m)'] * 4
+    x_labels = [PROFILE_RADIUS_LABEL] * 4
     fig, axes = ipfn_plots(
         x=x_data,
         y=y_data,
